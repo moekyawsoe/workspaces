@@ -14,8 +14,6 @@ dirs = "5"
 open = "5"
 rfd = "0.14"
 notify = "6"
-portable-pty = "0.8"
-vte = "0.13"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 xdg = "2"

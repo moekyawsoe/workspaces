@@ -296,6 +296,198 @@ pub fn get_default_editors() -> Vec<&'static str> {
     ]
 }
 
+/// Detects available system terminal emulators and returns the best one.
+/// Returns (command, args_to_pass_to_command)
+pub fn detect_system_terminal() -> Option<(String, Vec<String>)> {
+    #[cfg(target_os = "linux")]
+    {
+        let terminals: [(&str, &[&str]); 8] = [
+            ("gnome-terminal", &["--"]),
+            ("konsole", &["-e"]),
+            ("xfce4-terminal", &["-e"]),
+            ("alacritty", &["-e"]),
+            ("kitty", &[]),
+            ("wezterm", &["start", "--"]),
+            ("foot", &[]),
+            ("xterm", &["-e"]),
+        ];
+
+        for (cmd, args) in terminals {
+            if command_exists(cmd) {
+                return Some((cmd.to_string(), args.iter().map(|s| s.to_string()).collect()));
+            }
+        }
+
+        // Fallback to x-terminal-emulator (Debian/Ubuntu alternative system)
+        if command_exists("x-terminal-emulator") {
+            return Some(("x-terminal-emulator".to_string(), vec!["-e".to_string()]));
+        }
+
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: use osascript to open Terminal.app
+        Some(("osascript".to_string(), vec![
+            "-e".to_string(),
+            r#"tell application "Terminal" to do script ""#.to_string(),
+        ]))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: try Windows Terminal, then fall back to cmd
+        if command_exists("wt") {
+            Some(("wt".to_string(), vec![]))
+        } else {
+            Some(("cmd".to_string(), vec!["/c".to_string(), "start".to_string()]))
+        }
+    }
+}
+
+/// Opens the system terminal emulator in the given working directory.
+pub fn open_system_terminal(working_dir: &std::path::Path) -> Result<(), String> {
+    let (terminal, _prefix_args) = detect_system_terminal()
+        .ok_or_else(|| "No system terminal emulator found. Please install one (gnome-terminal, konsole, alacritty, etc.)".to_string())?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut cmd = std::process::Command::new(&terminal);
+
+        match terminal.as_str() {
+            "gnome-terminal" => {
+                cmd.arg(format!("--working-directory={}", working_dir.display()));
+                cmd.arg("--").arg("bash");
+            }
+            "konsole" => {
+                cmd.arg("--workdir").arg(working_dir);
+            }
+            "xfce4-terminal" => {
+                cmd.arg(format!("--working-directory={}", working_dir.display()));
+            }
+            "alacritty" => {
+                cmd.arg("--working-directory").arg(working_dir);
+            }
+            "kitty" => {
+                cmd.arg("--directory").arg(working_dir);
+            }
+            "foot" => {
+                cmd.arg(format!("--working-directory={}", working_dir.display()));
+            }
+            "wezterm" => {
+                cmd.arg("start").arg("--cwd").arg(working_dir);
+            }
+            "xterm" => {
+                cmd.arg("-e").arg(format!("cd {} && exec $SHELL", working_dir.display()));
+            }
+            _ => {
+                cmd.current_dir(working_dir);
+            }
+        }
+
+        cmd.spawn().map_err(|e| format!("Failed to open terminal: {}", e))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let dir = working_dir.to_string_lossy();
+        let script = format!(
+            r#"tell application "Terminal" to do script "cd '{}'"#,
+            dir
+        );
+        std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .spawn()
+            .map_err(|e| format!("Failed to open Terminal.app: {}", e))?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let dir = working_dir.to_string_lossy();
+        match terminal.as_str() {
+            "wt" => {
+                std::process::Command::new("wt")
+                    .arg("-d")
+                    .arg(&dir)
+                    .spawn()
+                    .map_err(|e| format!("Failed to open Windows Terminal: {}", e))?;
+            }
+            "cmd" => {
+                std::process::Command::new("cmd")
+                    .arg("/c")
+                    .arg("start")
+                    .arg("cmd")
+                    .arg("/k")
+                    .arg("cd")
+                    .arg(&dir)
+                    .spawn()
+                    .map_err(|e| format!("Failed to open cmd: {}", e))?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns a list of detected terminal emulators with their names.
+pub fn list_available_terminals() -> Vec<(String, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        let terminals = [
+            ("gnome-terminal", "GNOME Terminal"),
+            ("konsole", "KDE Konsole"),
+            ("xfce4-terminal", "XFCE Terminal"),
+            ("alacritty", "Alacritty"),
+            ("kitty", "Kitty"),
+            ("wezterm", "WezTerm"),
+            ("foot", "Foot"),
+            ("xterm", "Xterm"),
+        ];
+
+        terminals
+            .iter()
+            .filter(|(cmd, _)| command_exists(cmd))
+            .map(|(cmd, name)| (cmd.to_string(), name.to_string()))
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        vec![("Terminal.app".to_string(), "Terminal".to_string())]
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut result = Vec::new();
+        if command_exists("wt") {
+            result.push(("wt".to_string(), "Windows Terminal".to_string()));
+        }
+        result.push(("cmd".to_string(), "Command Prompt".to_string()));
+        result
+    }
+}
+
+#[cfg(unix)]
+fn command_exists(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn command_exists(cmd: &str) -> bool {
+    std::process::Command::new("where")
+        .arg(cmd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 pub fn format_size(size: u64) -> String {
     if size < 1024 {
         format!("{} B", size)
