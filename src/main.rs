@@ -107,8 +107,8 @@ impl WorkspaceForm {
             let mut map = HashMap::new();
             for (key, value) in &self.settings.entries {
                 if !key.is_empty() {
-                    let json_value: serde_json::Value =
-                        serde_json::from_str(value).unwrap_or(serde_json::Value::String(value.clone()));
+                    let json_value: serde_json::Value = serde_json::from_str(value)
+                        .unwrap_or(serde_json::Value::String(value.clone()));
                     map.insert(key.clone(), json_value);
                 }
             }
@@ -190,9 +190,17 @@ impl Default for WorkspaceManagerApp {
             .to_string();
 
         let available = list_available_terminals();
-        let selected_terminal = available.first()
+        let selected_terminal = available
+            .first()
             .map(|(cmd, _)| cmd.clone())
             .unwrap_or_default();
+
+        let (saved_terminal, _known_terminals) = Self::load_settings();
+        let selected_terminal = if saved_terminal.is_empty() {
+            selected_terminal
+        } else {
+            saved_terminal
+        };
 
         Self {
             folder_path,
@@ -216,6 +224,45 @@ impl Default for WorkspaceManagerApp {
 }
 
 impl WorkspaceManagerApp {
+    fn load_settings() -> (String, Vec<String>) {
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("workspace-manager");
+
+        let config_file = config_dir.join("settings.json");
+        if config_file.exists() {
+            if let Ok(content) = std::fs::read_to_string(&config_file) {
+                if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let terminal = settings
+                        .get("terminal")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    return (terminal, Vec::new());
+                }
+            }
+        }
+        (String::new(), Vec::new())
+    }
+
+    fn save_settings(&self) {
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("workspace-manager");
+
+        let _ = std::fs::create_dir_all(&config_dir);
+        let config_file = config_dir.join("settings.json");
+
+        let settings = serde_json::json!({
+            "terminal": self.selected_terminal
+        });
+
+        let _ = std::fs::write(
+            &config_file,
+            serde_json::to_string_pretty(&settings).unwrap_or_default(),
+        );
+    }
+
     fn load_workspaces(&mut self) {
         let path = std::path::Path::new(&self.folder_path);
         match list_workspaces(path) {
@@ -242,7 +289,7 @@ impl WorkspaceManagerApp {
     }
 
     fn open_system_terminal(&mut self, path: std::path::PathBuf) {
-        match open_system_terminal(&path) {
+        match open_system_terminal(&path, Some(&self.selected_terminal)) {
             Ok(()) => {
                 self.terminal_message = Some(format!("Opened terminal in '{}'", path.display()));
             }
@@ -355,10 +402,18 @@ impl WorkspaceManagerApp {
     fn open_workspace(&mut self, index: usize, action: &str) {
         let (folder_path, ws_path, ws_name, config_folders) = match self.workspaces.get(index) {
             Some(ws) => {
-                let folder_path = ws.config.folders.first()
+                let folder_path = ws
+                    .config
+                    .folders
+                    .first()
                     .map(|f| std::path::PathBuf::from(&f.path))
                     .unwrap_or_else(|| ws.path.parent().unwrap_or(&ws.path).to_path_buf());
-                (folder_path, ws.path.clone(), ws.name.clone(), ws.config.folders.clone())
+                (
+                    folder_path,
+                    ws.path.clone(),
+                    ws.name.clone(),
+                    ws.config.folders.clone(),
+                )
             }
             None => return,
         };
@@ -368,7 +423,8 @@ impl WorkspaceManagerApp {
                 self.open_system_terminal(folder_path);
             }
             "file_manager" => {
-                let folder_path = config_folders.first()
+                let folder_path = config_folders
+                    .first()
                     .map(|f| std::path::PathBuf::from(&f.path))
                     .unwrap_or_else(|| ws_path.clone());
                 open_in_file_manager(&folder_path);
@@ -387,8 +443,7 @@ impl WorkspaceManagerApp {
                 }
 
                 open_with_editor(&ws_path, editor);
-                self.message =
-                    Message::Info(format!("Opening '{}' with {}", ws_name, editor));
+                self.message = Message::Info(format!("Opening '{}' with {}", ws_name, editor));
             }
             "default" => {
                 let _ = open::that(&ws_path);
@@ -452,13 +507,11 @@ impl WorkspaceManagerApp {
             ui.horizontal(|ui| {
                 ui.text_edit_singleline(&mut self.new_setting_key);
                 ui.text_edit_singleline(&mut self.new_setting_value);
-                if ui.button("+ Add").clicked()
-                    && !self.new_setting_key.is_empty()
-                {
-                    self.form.settings.entries.push((
-                        self.new_setting_key.clone(),
-                        self.new_setting_value.clone(),
-                    ));
+                if ui.button("+ Add").clicked() && !self.new_setting_key.is_empty() {
+                    self.form
+                        .settings
+                        .entries
+                        .push((self.new_setting_key.clone(), self.new_setting_value.clone()));
                     self.new_setting_key.clear();
                     self.new_setting_value.clear();
                 }
@@ -742,7 +795,10 @@ impl eframe::App for WorkspaceManagerApp {
             PendingAction::OpenEditor(idx) => self.show_editor_select(idx),
             PendingAction::OpenTerminal(idx) => {
                 if let Some(ws) = self.workspaces.get(idx) {
-                    let folder_path = ws.config.folders.first()
+                    let folder_path = ws
+                        .config
+                        .folders
+                        .first()
                         .map(|f| std::path::PathBuf::from(&f.path))
                         .unwrap_or_else(|| ws.path.parent().unwrap_or(&ws.path).to_path_buf());
                     self.open_system_terminal(folder_path);
@@ -765,8 +821,7 @@ impl eframe::App for WorkspaceManagerApp {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 ui.label("Name:");
-                                ui.text_edit_singleline(&mut self.new_name)
-                                    .request_focus();
+                                ui.text_edit_singleline(&mut self.new_name).request_focus();
                             });
 
                             ui.add_space(10.0);
@@ -826,10 +881,7 @@ impl eframe::App for WorkspaceManagerApp {
                         .resizable(false)
                         .show(ctx, |ui| {
                             ui.vertical(|ui| {
-                                ui.label(format!(
-                                    "Are you sure you want to delete '{}'?",
-                                    name
-                                ));
+                                ui.label(format!("Are you sure you want to delete '{}'?", name));
                                 ui.label(format!("Path: {}", path));
 
                                 ui.add_space(10.0);
@@ -857,7 +909,11 @@ impl eframe::App for WorkspaceManagerApp {
                             ui.add_space(10.0);
                             for editor in get_default_editors() {
                                 if ui
-                                    .selectable_value(&mut self.selected_editor, editor.to_string(), editor)
+                                    .selectable_value(
+                                        &mut self.selected_editor,
+                                        editor.to_string(),
+                                        editor,
+                                    )
                                     .clicked()
                                 {
                                     self.open_workspace(idx, "editor");
@@ -909,6 +965,7 @@ impl eframe::App for WorkspaceManagerApp {
                                     let selected = cmd == &self.selected_terminal;
                                     if ui.selectable_label(selected, name).clicked() {
                                         self.selected_terminal = cmd.clone();
+                                        self.save_settings();
                                     }
                                 }
                             }
@@ -917,10 +974,12 @@ impl eframe::App for WorkspaceManagerApp {
                             ui.separator();
                             ui.horizontal(|ui| {
                                 if ui.button("Test Terminal").clicked() {
+                                    self.save_settings();
                                     let home = dirs::home_dir().unwrap_or_default();
                                     self.open_system_terminal(home);
                                 }
                                 if ui.button("Close").clicked() {
+                                    self.save_settings();
                                     self.dialog = DialogState::None;
                                 }
                             });

@@ -301,7 +301,7 @@ pub fn get_default_editors() -> Vec<&'static str> {
 pub fn detect_system_terminal() -> Option<(String, Vec<String>)> {
     #[cfg(target_os = "linux")]
     {
-        let terminals: [(&str, &[&str]); 8] = [
+        let terminals: [(&str, &[&str]); 9] = [
             ("gnome-terminal", &["--"]),
             ("konsole", &["-e"]),
             ("xfce4-terminal", &["-e"]),
@@ -310,11 +310,15 @@ pub fn detect_system_terminal() -> Option<(String, Vec<String>)> {
             ("wezterm", &["start", "--"]),
             ("foot", &[]),
             ("xterm", &["-e"]),
+            ("st", &["-e"]),
         ];
 
         for (cmd, args) in terminals {
             if command_exists(cmd) {
-                return Some((cmd.to_string(), args.iter().map(|s| s.to_string()).collect()));
+                return Some((
+                    cmd.to_string(),
+                    args.iter().map(|s| s.to_string()).collect(),
+                ));
             }
         }
 
@@ -329,10 +333,13 @@ pub fn detect_system_terminal() -> Option<(String, Vec<String>)> {
     #[cfg(target_os = "macos")]
     {
         // macOS: use osascript to open Terminal.app
-        Some(("osascript".to_string(), vec![
-            "-e".to_string(),
-            r#"tell application "Terminal" to do script ""#.to_string(),
-        ]))
+        Some((
+            "osascript".to_string(),
+            vec![
+                "-e".to_string(),
+                r#"tell application "Terminal" to do script ""#.to_string(),
+            ],
+        ))
     }
 
     #[cfg(target_os = "windows")]
@@ -341,15 +348,26 @@ pub fn detect_system_terminal() -> Option<(String, Vec<String>)> {
         if command_exists("wt") {
             Some(("wt".to_string(), vec![]))
         } else {
-            Some(("cmd".to_string(), vec!["/c".to_string(), "start".to_string()]))
+            Some((
+                "cmd".to_string(),
+                vec!["/c".to_string(), "start".to_string()],
+            ))
         }
     }
 }
 
 /// Opens the system terminal emulator in the given working directory.
-pub fn open_system_terminal(working_dir: &std::path::Path) -> Result<(), String> {
-    let (terminal, _prefix_args) = detect_system_terminal()
-        .ok_or_else(|| "No system terminal emulator found. Please install one (gnome-terminal, konsole, alacritty, etc.)".to_string())?;
+/// If `terminal` is provided, uses that terminal; otherwise auto-detects.
+pub fn open_system_terminal(
+    working_dir: &std::path::Path,
+    terminal: Option<&str>,
+) -> Result<(), String> {
+    let terminal = match terminal {
+        Some(t) => t.to_string(),
+        None => detect_system_terminal()
+            .ok_or_else(|| "No system terminal emulator found. Please install one (gnome-terminal, konsole, alacritty, etc.)".to_string())?
+            .0,
+    };
 
     #[cfg(target_os = "linux")]
     {
@@ -378,24 +396,23 @@ pub fn open_system_terminal(working_dir: &std::path::Path) -> Result<(), String>
             "wezterm" => {
                 cmd.arg("start").arg("--cwd").arg(working_dir);
             }
-            "xterm" => {
-                cmd.arg("-e").arg(format!("cd {} && exec $SHELL", working_dir.display()));
+            "xterm" | "st" => {
+                cmd.arg("-e")
+                    .arg(format!("cd {} && exec $SHELL", working_dir.display()));
             }
             _ => {
                 cmd.current_dir(working_dir);
             }
         }
 
-        cmd.spawn().map_err(|e| format!("Failed to open terminal: {}", e))?;
+        cmd.spawn()
+            .map_err(|e| format!("Failed to open terminal: {}", e))?;
     }
 
     #[cfg(target_os = "macos")]
     {
         let dir = working_dir.to_string_lossy();
-        let script = format!(
-            r#"tell application "Terminal" to do script "cd '{}'"#,
-            dir
-        );
+        let script = format!(r#"tell application "Terminal" to do script "cd '{}'"#, dir);
         std::process::Command::new("osascript")
             .arg("-e")
             .arg(&script)
@@ -445,6 +462,7 @@ pub fn list_available_terminals() -> Vec<(String, String)> {
             ("wezterm", "WezTerm"),
             ("foot", "Foot"),
             ("xterm", "Xterm"),
+            ("st", "Simple Terminal (st)"),
         ];
 
         terminals
