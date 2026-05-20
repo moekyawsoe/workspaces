@@ -283,6 +283,7 @@ fn open_terminal_with_editor(path: &Path, editor: &str) -> std::io::Result<()> {
         .arg(editor)
         .arg(path)
         .spawn()
+        .map(|_| ())
 }
 
 pub fn get_default_editors() -> Vec<&'static str> {
@@ -423,11 +424,12 @@ pub fn open_system_terminal(
     #[cfg(target_os = "windows")]
     {
         let dir = working_dir.to_string_lossy();
+        let dir_str = dir.as_ref();
         match terminal.as_str() {
             "wt" => {
                 std::process::Command::new("wt")
                     .arg("-d")
-                    .arg(&dir)
+                    .arg(dir_str)
                     .spawn()
                     .map_err(|e| format!("Failed to open Windows Terminal: {}", e))?;
             }
@@ -438,7 +440,7 @@ pub fn open_system_terminal(
                     .arg("cmd")
                     .arg("/k")
                     .arg("cd")
-                    .arg(&dir)
+                    .arg(dir_str)
                     .spawn()
                     .map_err(|e| format!("Failed to open cmd: {}", e))?;
             }

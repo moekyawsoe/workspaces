@@ -2,7 +2,15 @@
 
 A cross-platform desktop application to manage `.code-workspace` files with a clean GUI.
 
-![Workspace Manager](logo.png)
+<p align="center">
+  <img src="logo.png" alt="Workspace Manager Icon" width="128" height="128">
+</p>
+
+## Preview
+
+<p align="center">
+  <img src="screenshot.png" alt="Workspace Manager Screenshot" width="800">
+</p>
 
 ## Features
 
@@ -16,11 +24,9 @@ A cross-platform desktop application to manage `.code-workspace` files with a cl
 
 | Platform | Format | Download |
 |----------|--------|----------|
-| Linux | .deb | [Download](https://github.com/moekyawsoe/workspaces/releases/latest/download/workspace-manager-linux.zip) |
-| macOS | .dmg | [Download](https://github.com/moekyawsoe/workspaces/releases/latest/download/workspace-manager-macos.zip) |
-| Windows | .exe | [Download](https://github.com/moekyawsoe/workspaces/releases/latest/download/workspace-manager-windows.zip) |
-
-> **Note:** Replace the download links with your actual GitHub repository URL.
+| Linux | .deb | [Download](https://github.com/moekyawsoe/workspaces/releases/latest) |
+| macOS | .dmg | [Download](https://github.com/moekyawsoe/workspaces/releases/latest) |
+| Windows | .exe | [Download](https://github.com/moekyawsoe/workspaces/releases/latest) |
 
 ## Installation
 
