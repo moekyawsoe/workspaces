@@ -137,6 +137,7 @@ enum DialogState {
     Delete(usize),
     EditorSelect(usize),
     TerminalSettings,
+    About,
 }
 
 #[derive(Clone)]
@@ -564,6 +565,11 @@ impl eframe::App for WorkspaceManagerApp {
                         self.show_create_dialog();
                         ui.close_menu();
                     }
+                    ui.separator();
+                    if ui.button("Exit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        ui.close_menu();
+                    }
                 });
 
                 ui.menu_button("View", |ui| {
@@ -573,6 +579,13 @@ impl eframe::App for WorkspaceManagerApp {
                     }
                     if ui.button("Terminal Settings").clicked() {
                         self.dialog = DialogState::TerminalSettings;
+                        ui.close_menu();
+                    }
+                });
+
+                ui.menu_button("Help", |ui| {
+                    if ui.button("About").clicked() {
+                        self.dialog = DialogState::About;
                         ui.close_menu();
                     }
                 });
@@ -982,6 +995,41 @@ impl eframe::App for WorkspaceManagerApp {
                                     self.save_settings();
                                     self.dialog = DialogState::None;
                                 }
+                            });
+                        });
+                    });
+            }
+            DialogState::About => {
+                egui::Window::new("About Workspace Manager")
+                    .collapsible(false)
+                    .resizable(false)
+                    .default_width(350.0)
+                    .show(ctx, |ui| {
+                        ui.vertical(|ui| {
+                            ui.centered_and_justified(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.heading("Workspace Manager");
+                                    ui.add_space(8.0);
+                                    ui.label(egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).size(14.0));
+                                    ui.add_space(12.0);
+                                    ui.separator();
+                                    ui.add_space(8.0);
+                                    ui.label(egui::RichText::new("Developer").strong());
+                                    ui.label("Moe Kyaw Soe");
+                                    ui.add_space(8.0);
+                                    ui.label(egui::RichText::new("Website").strong());
+                                    if ui.link("www.moekyawsoe.com").clicked() {
+                                        let _ = open::that("https://www.moekyawsoe.com");
+                                    }
+                                    ui.add_space(12.0);
+                                    ui.separator();
+                                    ui.add_space(8.0);
+                                    ui.label(egui::RichText::new(env!("CARGO_PKG_DESCRIPTION")).size(12.0).color(ui.visuals().weak_text_color()));
+                                    ui.add_space(16.0);
+                                    if ui.button("Close").clicked() {
+                                        self.dialog = DialogState::None;
+                                    }
+                                });
                             });
                         });
                     });

@@ -20,6 +20,7 @@ mkdir -p "$DEB_DIR/usr/share/applications"
 mkdir -p "$DEB_DIR/usr/share/icons/hicolor/256x256/apps"
 
 cp target/release/$APP_NAME "$DEB_DIR/usr/bin/"
+cp logo.png "$DEB_DIR/usr/share/icons/hicolor/256x256/apps/$APP_NAME.png"
 
 cat > "$DEB_DIR/DEBIAN/control" << EOF
 Package: $APP_NAME

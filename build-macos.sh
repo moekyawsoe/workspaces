@@ -26,6 +26,7 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 cp "$TARGET_DIR/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/"
+cp logo.png "$APP_BUNDLE/Contents/Resources/icon.png"
 
 cat > "$APP_BUNDLE/Contents/Info.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -52,6 +53,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << EOF
     <string>10.15</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>CFBundleIconFile</key>
+    <string>icon.png</string>
 </dict>
 </plist>
 EOF
