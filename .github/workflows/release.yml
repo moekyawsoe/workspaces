@@ -95,7 +95,7 @@ jobs:
       - name: Sync Cargo.toml version
         shell: pwsh
         run: |
-          $VERSION = "${GITHUB_REF_NAME}" -replace "^v",""
+          $VERSION = $env:GITHUB_REF_NAME -replace "^v",""
           (Get-Content Cargo.toml) -replace '^version = ".*"', "version = `"$VERSION`"" | Set-Content Cargo.toml
           Get-Content Cargo.toml
 
@@ -114,7 +114,7 @@ jobs:
       - name: Create .zip archive
         shell: pwsh
         run: |
-          $VERSION = "${GITHUB_REF_NAME}" -replace "^v",""
+          $VERSION = $env:GITHUB_REF_NAME -replace "^v",""
           $BUILD_DIR = "build\windows"
           New-Item -ItemType Directory -Force -Path $BUILD_DIR
           Copy-Item "target\release\workspace-manager.exe" "$BUILD_DIR\workspace-manager.exe"
