@@ -29,6 +29,7 @@ pub struct WorkspaceConfig {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct WorkspaceFile {
     pub name: String,
     pub path: PathBuf,

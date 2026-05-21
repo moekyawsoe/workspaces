@@ -1,8 +1,10 @@
+mod terminal;
 mod workspace;
 
 use eframe::egui;
 use std::collections::HashMap;
 use std::time::SystemTime;
+use terminal::*;
 use workspace::*;
 
 #[derive(Clone)]
@@ -137,6 +139,7 @@ enum DialogState {
     Delete(usize),
     EditorSelect(usize),
     TerminalSettings,
+    TerminalPreferences,
     About,
 }
 
@@ -180,6 +183,12 @@ struct WorkspaceManagerApp {
 
     selected_terminal: String,
     terminal_message: Option<String>,
+
+    terminal_tabs: Vec<TerminalTab>,
+    active_tab_index: usize,
+    terminal_visible: bool,
+    terminal_settings: TerminalSettings,
+    discovered_fonts: Vec<(String, std::path::PathBuf)>,
 }
 
 impl Default for WorkspaceManagerApp {
@@ -203,6 +212,8 @@ impl Default for WorkspaceManagerApp {
             saved_terminal
         };
 
+        let terminal_settings = load_terminal_settings();
+
         Self {
             folder_path,
             workspaces: Vec::new(),
@@ -220,6 +231,11 @@ impl Default for WorkspaceManagerApp {
             new_setting_value: String::new(),
             selected_terminal,
             terminal_message: None,
+            terminal_tabs: Vec::new(),
+            active_tab_index: 0,
+            terminal_visible: false,
+            terminal_settings,
+            discovered_fonts: Vec::new(),
         }
     }
 }
@@ -296,6 +312,98 @@ impl WorkspaceManagerApp {
             }
             Err(e) => {
                 self.message = Message::Error(e);
+            }
+        }
+    }
+
+    fn open_builtin_terminal(&mut self, working_dir: Option<std::path::PathBuf>) {
+        if self.terminal_tabs.is_empty() {
+            self.add_terminal_tab(working_dir);
+        } else {
+            self.terminal_visible = true;
+        }
+    }
+
+    fn close_builtin_terminal(&mut self) {
+        self.terminal_visible = false;
+    }
+
+    fn toggle_builtin_terminal(&mut self, working_dir: Option<std::path::PathBuf>) {
+        if self.terminal_visible {
+            self.close_builtin_terminal();
+        } else {
+            self.open_builtin_terminal(working_dir);
+        }
+    }
+
+    fn add_terminal_tab(&mut self, working_dir: Option<std::path::PathBuf>) {
+        let name = format!("Tab {}", self.terminal_tabs.len() + 1);
+        match TerminalTab::new(name, self.terminal_settings.clone(), working_dir) {
+            Ok(tab) => {
+                self.terminal_tabs.push(tab);
+                self.active_tab_index = self.terminal_tabs.len() - 1;
+                self.terminal_visible = true;
+            }
+            Err(e) => {
+                self.message = Message::Error(format!("Failed to open terminal: {}", e));
+            }
+        }
+    }
+
+    fn close_tab(&mut self, index: usize) {
+        if index < self.terminal_tabs.len() {
+            self.terminal_tabs.remove(index);
+            if self.terminal_tabs.is_empty() {
+                self.terminal_visible = false;
+                self.active_tab_index = 0;
+            } else if self.active_tab_index >= self.terminal_tabs.len() {
+                self.active_tab_index = self.terminal_tabs.len() - 1;
+            }
+        }
+    }
+
+    fn split_active_terminal(&mut self, direction: SplitDirection) {
+        if self.terminal_tabs.is_empty() {
+            return;
+        }
+        let tab = &mut self.terminal_tabs[self.active_tab_index];
+        if let Some(active_id) = tab.active_terminal_id {
+            let working_dir = dirs::home_dir();
+            match Terminal::new(self.terminal_settings.clone(), working_dir) {
+                Ok(new_term) => {
+                    let mut term_opt = Some(new_term);
+                    tab.root.split(active_id, direction, &mut term_opt);
+                }
+                Err(e) => {
+                    self.message = Message::Error(format!("Failed to split terminal: {}", e));
+                }
+            }
+        }
+    }
+
+    fn close_active_pane(&mut self) {
+        if self.terminal_tabs.is_empty() {
+            return;
+        }
+        let tab = &mut self.terminal_tabs[self.active_tab_index];
+        if let Some(active_id) = tab.active_terminal_id {
+            let mut removed = false;
+            let opt_pane = tab.root.close_pane(active_id, &mut removed);
+            if removed {
+                if let Some(new_root) = opt_pane {
+                    match new_root {
+                        TerminalPane::Placeholder => {
+                            let index_to_close = self.active_tab_index;
+                            self.close_tab(index_to_close);
+                        }
+                        _ => {
+                            tab.root = new_root;
+                            tab.active_terminal_id = tab.root.any_terminal_id();
+                        }
+                    }
+                } else {
+                    tab.active_terminal_id = tab.root.any_terminal_id();
+                }
             }
         }
     }
@@ -549,6 +657,15 @@ impl WorkspaceManagerApp {
 
 impl eframe::App for WorkspaceManagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Backtick) && (i.modifiers.ctrl || i.modifiers.command)) {
+            let working_dir = dirs::home_dir();
+            self.toggle_builtin_terminal(working_dir);
+        }
+
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.terminal_tabs.clear();
+        }
+
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -577,8 +694,20 @@ impl eframe::App for WorkspaceManagerApp {
                         self.load_workspaces();
                         ui.close_menu();
                     }
+                    ui.separator();
+                    let terminal_label = if self.terminal_visible { "Hide Terminal" } else { "Show Terminal" };
+                    if ui.button(terminal_label).clicked() {
+                        let working_dir = dirs::home_dir();
+                        self.toggle_builtin_terminal(working_dir);
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Terminal Settings").clicked() {
                         self.dialog = DialogState::TerminalSettings;
+                        ui.close_menu();
+                    }
+                    if ui.button("Terminal Preferences").clicked() {
+                        self.dialog = DialogState::TerminalPreferences;
                         ui.close_menu();
                     }
                 });
@@ -591,6 +720,76 @@ impl eframe::App for WorkspaceManagerApp {
                 });
             });
         });
+
+        if self.terminal_visible {
+            egui::TopBottomPanel::bottom("terminal_panel")
+                .resizable(true)
+                .default_height(300.0)
+                .min_height(100.0)
+                .show(ctx, |ui| {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            // Tab list
+                            let mut tab_to_close = None;
+                            for (idx, tab) in self.terminal_tabs.iter().enumerate() {
+                                let is_active = idx == self.active_tab_index;
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    let text = format!(" {} ", tab.name);
+                                    if ui.selectable_label(is_active, text).clicked() {
+                                        self.active_tab_index = idx;
+                                    }
+                                    if ui.small_button("x").clicked() {
+                                        tab_to_close = Some(idx);
+                                    }
+                                });
+                                ui.add_space(8.0);
+                            }
+                            if let Some(idx) = tab_to_close {
+                                self.close_tab(idx);
+                            }
+                            if ui.button("+").on_hover_text("New Tab").clicked() {
+                                let working_dir = dirs::home_dir();
+                                self.add_terminal_tab(working_dir);
+                            }
+                            
+                            // Controls on the right
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("x").on_hover_text("Hide Terminal").clicked() {
+                                    self.close_builtin_terminal();
+                                }
+                                if ui.small_button("⚙").on_hover_text("Preferences").clicked() {
+                                    self.dialog = DialogState::TerminalPreferences;
+                                }
+                                ui.separator();
+                                if ui.small_button("x Close Pane").on_hover_text("Close active pane").clicked() {
+                                    self.close_active_pane();
+                                }
+                                if ui.small_button("| Split V").on_hover_text("Split active pane vertically").clicked() {
+                                    self.split_active_terminal(SplitDirection::Vertical);
+                                }
+                                if ui.small_button("| Split H").on_hover_text("Split active pane horizontally").clicked() {
+                                    self.split_active_terminal(SplitDirection::Horizontal);
+                                }
+                            });
+                        });
+                        ui.separator();
+                        
+                        if !self.terminal_tabs.is_empty() {
+                            if self.active_tab_index >= self.terminal_tabs.len() {
+                                self.active_tab_index = self.terminal_tabs.len() - 1;
+                            }
+                            let tab = &mut self.terminal_tabs[self.active_tab_index];
+                            let active_id = &mut tab.active_terminal_id;
+                            tab.root.render(ui, active_id, ctx);
+                        } else {
+                            ui.centered_and_justified(|ui| {
+                                ui.label("No tabs open. Click '+' to open a terminal.");
+                            });
+                        }
+                    });
+                });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical(|ui| {
@@ -630,7 +829,7 @@ impl eframe::App for WorkspaceManagerApp {
                         ui.horizontal(|ui| {
                             ui.label("ℹ️");
                             ui.label(&msg);
-                            if ui.button("×").clicked() {
+                            if ui.button("x").clicked() {
                                 self.message = Message::None;
                             }
                         });
@@ -640,7 +839,7 @@ impl eframe::App for WorkspaceManagerApp {
                         ui.horizontal(|ui| {
                             ui.label("❌");
                             ui.label(&msg);
-                            if ui.button("×").clicked() {
+                            if ui.button("x").clicked() {
                                 self.message = Message::None;
                             }
                         });
@@ -650,7 +849,7 @@ impl eframe::App for WorkspaceManagerApp {
                         ui.horizontal(|ui| {
                             ui.label("✅");
                             ui.label(&msg);
-                            if ui.button("×").clicked() {
+                            if ui.button("x").clicked() {
                                 self.message = Message::None;
                             }
                         });
@@ -663,7 +862,7 @@ impl eframe::App for WorkspaceManagerApp {
                     ui.horizontal(|ui| {
                         ui.label("💻");
                         ui.label(&msg);
-                        if ui.button("×").clicked() {
+                        if ui.button("x").clicked() {
                             self.terminal_message = None;
                         }
                     });
@@ -999,6 +1198,122 @@ impl eframe::App for WorkspaceManagerApp {
                         });
                     });
             }
+            DialogState::TerminalPreferences => {
+                egui::Window::new("Terminal Preferences")
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_width(450.0)
+                    .default_height(400.0)
+                    .show(ctx, |ui| {
+                        ui.vertical(|ui| {
+                            ui.heading("Terminal Preferences");
+                            ui.add_space(10.0);
+
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.group(|ui| {
+                                    ui.strong("Theme");
+                                    ui.add_space(5.0);
+                                    let themes = ["Catppuccin Mocha", "Ubuntu", "WSL"];
+                                    let current_theme = match self.terminal_settings.theme.background {
+                                        c if c == TerminalTheme::catppuccin_mocha().background => 0,
+                                        c if c == TerminalTheme::ubuntu().background => 1,
+                                        _ => 2,
+                                    };
+                                    for (i, theme_name) in themes.iter().enumerate() {
+                                        let selected = i == current_theme;
+                                        if ui.selectable_value(&mut String::new(), if selected { "selected".to_string() } else { String::new() }, *theme_name).clicked() {
+                                            self.terminal_settings.theme = match i {
+                                                0 => TerminalTheme::catppuccin_mocha(),
+                                                1 => TerminalTheme::ubuntu(),
+                                                _ => TerminalTheme::wsl(),
+                                            };
+                                        }
+                                    }
+                                });
+
+                                ui.add_space(10.0);
+
+                                ui.group(|ui| {
+                                    ui.strong("Font");
+                                    ui.add_space(5.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Family:");
+                                        let selected_font = self.terminal_settings.font.family.clone();
+                                        egui::ComboBox::from_id_source("terminal_font_family_combo")
+                                            .selected_text(&selected_font)
+                                            .show_ui(ui, |ui| {
+                                                let is_default = selected_font == "JetBrains Mono" || selected_font.is_empty();
+                                                if ui.selectable_label(is_default, "System Monospace").clicked() {
+                                                    self.terminal_settings.font.family = "JetBrains Mono".to_string();
+                                                }
+                                                for (name, _) in &self.discovered_fonts {
+                                                    let is_selected = selected_font == *name;
+                                                    if ui.selectable_label(is_selected, name).clicked() {
+                                                        self.terminal_settings.font.family = name.clone();
+                                                    }
+                                                }
+                                            });
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Size:");
+                                        ui.add(egui::DragValue::new(&mut self.terminal_settings.font.size)
+                                            .range(8.0..=32.0)
+                                            .speed(0.5));
+                                    });
+                                });
+
+                                ui.add_space(10.0);
+
+                                ui.group(|ui| {
+                                    ui.strong("Shell");
+                                    ui.add_space(5.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Path:");
+                                        ui.text_edit_singleline(&mut self.terminal_settings.shell);
+                                    });
+                                    ui.label(egui::RichText::new("Leave empty to use system default").size(11.0).color(ui.visuals().weak_text_color()));
+                                });
+
+                                ui.add_space(10.0);
+
+                                ui.group(|ui| {
+                                    ui.strong("Scrollback");
+                                    ui.add_space(5.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Lines:");
+                                        ui.add(egui::DragValue::new(&mut self.terminal_settings.scrollback_lines)
+                                            .range(100..=100000)
+                                            .speed(100));
+                                    });
+                                });
+                            });
+
+                            ui.add_space(12.0);
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                if ui.button("Save").clicked() {
+                                    save_terminal_settings(&self.terminal_settings);
+                                    apply_font(ctx, &self.terminal_settings.font.family, &self.discovered_fonts);
+                                    for tab in &mut self.terminal_tabs {
+                                        tab.root.update_settings(&self.terminal_settings);
+                                    }
+                                    self.dialog = DialogState::None;
+                                }
+                                if ui.button("Reset").clicked() {
+                                    self.terminal_settings = TerminalSettings::default();
+                                    save_terminal_settings(&self.terminal_settings);
+                                    apply_font(ctx, &self.terminal_settings.font.family, &self.discovered_fonts);
+                                    for tab in &mut self.terminal_tabs {
+                                        tab.root.update_settings(&self.terminal_settings);
+                                    }
+                                }
+                                if ui.button("Close").clicked() {
+                                    self.dialog = DialogState::None;
+                                }
+                            });
+                        });
+                    });
+            }
             DialogState::About => {
                 egui::Window::new("About Workspace Manager")
                     .collapsible(false)
@@ -1039,7 +1354,97 @@ impl eframe::App for WorkspaceManagerApp {
     }
 }
 
-fn main() -> eframe::Result {
+fn discover_fonts() -> Vec<(String, std::path::PathBuf)> {
+    let mut fonts = Vec::new();
+    let mut search_paths = vec![
+        std::path::PathBuf::from("/usr/share/fonts"),
+        std::path::PathBuf::from("/usr/local/share/fonts"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        search_paths.push(home.join(".local/share/fonts"));
+        search_paths.push(home.join(".fonts"));
+    }
+
+    let mut stack = search_paths;
+    let mut visited = std::collections::HashSet::new();
+    while let Some(dir) = stack.pop() {
+        if let Ok(canonical) = dir.canonicalize() {
+            if !visited.insert(canonical) {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    let ext_lower = ext.to_lowercase();
+                    if ext_lower == "ttf" || ext_lower == "otf" {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            fonts.push((stem.to_string(), path));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fonts.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    fonts.dedup_by(|a, b| a.0 == b.0);
+    fonts
+}
+
+fn apply_font(ctx: &egui::Context, family_name: &str, discovered_fonts: &[(String, std::path::PathBuf)]) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    if let Some((_, path)) = discovered_fonts.iter().find(|(name, _)| name == family_name) {
+        if let Ok(font_bytes) = std::fs::read(path) {
+            fonts.font_data.insert(
+                family_name.to_owned(),
+                egui::FontData::from_owned(font_bytes),
+            );
+            fonts.families.entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, family_name.to_owned());
+        }
+    }
+
+    if let Ok(myanmar_bytes) = std::fs::read("/usr/share/fonts/truetype/noto/NotoSansMyanmar-Regular.ttf") {
+        fonts.font_data.insert(
+            "NotoSansMyanmar".to_owned(),
+            egui::FontData::from_owned(myanmar_bytes),
+        );
+        
+        let proportional_list = fonts.families.entry(egui::FontFamily::Proportional).or_default();
+        if !proportional_list.contains(&"NotoSansMyanmar".to_owned()) {
+            let idx = proportional_list.len().min(1);
+            proportional_list.insert(idx, "NotoSansMyanmar".to_owned());
+        }
+
+        let monospace_list = fonts.families.entry(egui::FontFamily::Monospace).or_default();
+        if !monospace_list.contains(&"NotoSansMyanmar".to_owned()) {
+            let idx = monospace_list.len().min(1);
+            monospace_list.insert(idx, "NotoSansMyanmar".to_owned());
+        }
+    }
+
+    ctx.set_fonts(fonts);
+}
+
+fn main() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info.to_string();
+        if msg.contains("accesskit") || msg.contains("panic in a destructor") {
+            unsafe { libc::_exit(0); }
+        }
+        default_hook(info);
+    }));
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
@@ -1048,9 +1453,20 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    eframe::run_native(
-        "Workspace Manager",
-        options,
-        Box::new(|_cc| Ok(Box::new(WorkspaceManagerApp::default()))),
-    )
+    let app_creator = Box::new(|cc: &eframe::CreationContext<'_>| {
+        let discovered = discover_fonts();
+        let settings = load_terminal_settings();
+
+        apply_font(&cc.egui_ctx, &settings.font.family, &discovered);
+
+        let mut app = WorkspaceManagerApp::default();
+        app.discovered_fonts = discovered;
+        app.terminal_settings = settings;
+
+        Ok(Box::new(app) as Box<dyn eframe::App>)
+    });
+
+    let _ = eframe::run_native("Workspace Manager", options, app_creator);
+
+    unsafe { libc::_exit(0); }
 }
