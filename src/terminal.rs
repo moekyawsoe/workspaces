@@ -1577,6 +1577,35 @@ impl egui::Widget for TerminalWidget<'_> {
                             egui::Event::Paste(text) => {
                                 self.terminal.paste(text);
                             }
+                            egui::Event::Copy => {
+                                if let Some(text) = state.get_selected_text() {
+                                    ui.ctx().output_mut(|o| o.copied_text = text);
+                                    self.terminal.clear_selection();
+                                } else {
+                                    #[cfg(target_os = "macos")]
+                                    {
+                                        if i.modifiers.ctrl {
+                                            self.terminal.input(b"\x03");
+                                        }
+                                    }
+                                    #[cfg(not(target_os = "macos"))]
+                                    {
+                                        self.terminal.input(b"\x03");
+                                    }
+                                }
+                            }
+                            egui::Event::Cut => {
+                                #[cfg(target_os = "macos")]
+                                {
+                                    if i.modifiers.ctrl {
+                                        self.terminal.input(b"\x18");
+                                    }
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                {
+                                    self.terminal.input(b"\x18");
+                                }
+                            }
                             _ => {}
                         }
                     }
