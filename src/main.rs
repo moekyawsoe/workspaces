@@ -1,16 +1,24 @@
 mod terminal;
+mod update;
 mod workspace;
 
 use eframe::egui;
 use std::collections::HashMap;
 use std::time::SystemTime;
 use terminal::*;
+use update::*;
 use workspace::*;
 
 #[derive(Clone)]
 struct FormFolder {
     path: String,
     name: String,
+}
+
+#[derive(Clone)]
+struct FormUrl {
+    label: String,
+    url: String,
 }
 
 #[derive(Clone)]
@@ -23,6 +31,7 @@ struct WorkspaceForm {
     folders: Vec<FormFolder>,
     settings: FormSettings,
     extensions: Vec<String>,
+    urls: Vec<FormUrl>,
 }
 
 impl Default for WorkspaceForm {
@@ -36,6 +45,7 @@ impl Default for WorkspaceForm {
                 entries: Vec::new(),
             },
             extensions: Vec::new(),
+            urls: Vec::new(),
         }
     }
 }
@@ -81,10 +91,18 @@ impl WorkspaceForm {
 
         let extensions = config.extensions.clone().unwrap_or_default();
 
+        let urls = config.urls.iter()
+            .map(|u| FormUrl {
+                label: u.label.clone(),
+                url: u.url.clone(),
+            })
+            .collect();
+
         Self {
             folders,
             settings,
             extensions,
+            urls,
         }
     }
 
@@ -123,11 +141,17 @@ impl WorkspaceForm {
             Some(self.extensions.clone())
         };
 
+        let urls: Vec<WorkspaceUrl> = self.urls.iter()
+            .filter(|u| !u.url.is_empty())
+            .map(|u| WorkspaceUrl::new(u.label.clone(), u.url.clone()))
+            .collect();
+
         WorkspaceConfig {
             folders,
             settings,
             extensions,
             launch: None,
+            urls,
         }
     }
 }
@@ -141,6 +165,7 @@ enum DialogState {
     TerminalSettings,
     TerminalPreferences,
     About,
+    ManageUrls(usize),
 }
 
 #[derive(Clone)]
@@ -159,6 +184,7 @@ enum PendingAction {
     OpenEditor(usize),
     OpenTerminal(usize),
     OpenBuiltinTerminal(usize),
+    OpenUrl(usize, usize),
     Edit(usize),
     Duplicate(usize),
     Delete(usize),
@@ -181,6 +207,8 @@ struct WorkspaceManagerApp {
     new_extension: String,
     new_setting_key: String,
     new_setting_value: String,
+    new_url_label: String,
+    new_url: String,
 
     selected_terminal: String,
     terminal_message: Option<String>,
@@ -191,6 +219,7 @@ struct WorkspaceManagerApp {
     terminal_visible: bool,
     terminal_settings: TerminalSettings,
     discovered_fonts: Vec<(String, std::path::PathBuf)>,
+    updater: Option<Updater>,
 }
 
 impl Default for WorkspaceManagerApp {
@@ -231,6 +260,8 @@ impl Default for WorkspaceManagerApp {
             new_extension: String::new(),
             new_setting_key: String::new(),
             new_setting_value: String::new(),
+            new_url_label: String::new(),
+            new_url: String::new(),
             selected_terminal,
             terminal_message: None,
             terminal_tabs: Vec::new(),
@@ -239,6 +270,7 @@ impl Default for WorkspaceManagerApp {
             terminal_visible: false,
             terminal_settings,
             discovered_fonts: Vec::new(),
+            updater: None,
         }
     }
 }
@@ -446,6 +478,13 @@ impl WorkspaceManagerApp {
     fn show_editor_select(&mut self, index: usize) {
         self.dialog = DialogState::EditorSelect(index);
         self.show_custom_editor = false;
+    }
+
+    fn get_updater(&mut self, ctx: &egui::Context) -> &Updater {
+        if self.updater.is_none() {
+            self.updater = Some(Updater::new(ctx.clone()));
+        }
+        self.updater.as_ref().unwrap()
     }
 
     fn create_workspace(&mut self) {
@@ -664,6 +703,42 @@ impl WorkspaceManagerApp {
                 }
             });
         });
+
+        ui.add_space(10.0);
+
+        ui.group(|ui| {
+            ui.strong("URLs");
+            let url_count = self.form.urls.len();
+            let mut remove_url = None;
+            for i in 0..url_count {
+                ui.horizontal(|ui| {
+                    ui.label("Label:");
+                    ui.add_sized([120.0, 20.0], egui::TextEdit::singleline(&mut self.form.urls[i].label));
+                    ui.label("URL:");
+                    ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.form.urls[i].url));
+                    if ui.button("Remove").clicked() {
+                        remove_url = Some(i);
+                    }
+                });
+            }
+            if let Some(idx) = remove_url {
+                self.form.urls.remove(idx);
+            }
+            ui.horizontal(|ui| {
+                ui.label("Label:");
+                ui.add_sized([120.0, 20.0], egui::TextEdit::singleline(&mut self.new_url_label));
+                ui.label("URL:");
+                ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.new_url));
+                if ui.button("+ Add").clicked() && !self.new_url.is_empty() {
+                    self.form.urls.push(FormUrl {
+                        label: self.new_url_label.clone(),
+                        url: self.new_url.clone(),
+                    });
+                    self.new_url_label.clear();
+                    self.new_url.clear();
+                }
+            });
+        });
     }
 }
 
@@ -841,6 +916,10 @@ impl eframe::App for WorkspaceManagerApp {
                 });
 
                 ui.menu_button("Help", |ui| {
+                    if ui.button("Check for Updates").clicked() {
+                        self.dialog = DialogState::About;
+                        ui.close_menu();
+                    }
                     if ui.button("About").clicked() {
                         self.dialog = DialogState::About;
                         ui.close_menu();
@@ -1039,7 +1118,7 @@ impl eframe::App for WorkspaceManagerApp {
                             });
                         });
                     } else {
-                        let filtered: Vec<(usize, String, u64, SystemTime, Vec<String>)> = self
+                        let filtered: Vec<(usize, String, u64, SystemTime, Vec<String>, Vec<(String, String)>)> = self
                             .workspaces
                             .iter()
                             .enumerate()
@@ -1054,7 +1133,10 @@ impl eframe::App for WorkspaceManagerApp {
                                 let folder_paths: Vec<String> = ws.config.folders.iter()
                                     .map(|f| f.path.clone())
                                     .collect();
-                                (idx, ws.name.clone(), ws.size, ws.modified, folder_paths)
+                                let urls: Vec<(String, String)> = ws.config.urls.iter()
+                                    .map(|u| (u.label.clone(), u.url.clone()))
+                                    .collect();
+                                (idx, ws.name.clone(), ws.size, ws.modified, folder_paths, urls)
                             })
                             .collect();
 
@@ -1072,7 +1154,7 @@ impl eframe::App for WorkspaceManagerApp {
                             for chunk in filtered.chunks(cols) {
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
-                                    for (idx, name, size, modified, folder_paths) in chunk {
+                                    for (idx, name, size, modified, folder_paths, urls) in chunk {
                                         let idx = *idx;
                                         let size = *size;
                                         let modified = *modified;
@@ -1105,6 +1187,27 @@ impl eframe::App for WorkspaceManagerApp {
                                                             ).truncate());
                                                         }
 
+                                                        if !urls.is_empty() {
+                                                            ui.add_space(4.0);
+                                                            for (url_label, url_value) in urls {
+                                                                ui.horizontal(|ui| {
+                                                                    let label_text = if url_label.is_empty() {
+                                                                        url_value.clone()
+                                                                    } else {
+                                                                        url_label.clone()
+                                                                    };
+                                                                    ui.add(egui::Label::new(
+                                                                        egui::RichText::new(label_text)
+                                                                            .size(11.0)
+                                                                            .color(ui.visuals().hyperlink_color),
+                                                                    ).truncate());
+                                                                    if ui.small_button("🌐").on_hover_text(format!("Open {}", url_value)).clicked() {
+                                                                        self.pending_action = PendingAction::OpenUrl(idx, urls.iter().position(|(_, u)| u == url_value).unwrap_or(0));
+                                                                    }
+                                                                });
+                                                            }
+                                                        }
+
                                                         ui.add_space(4.0);
                                                         ui.separator();
                                                         ui.horizontal(|ui| {
@@ -1124,6 +1227,9 @@ impl eframe::App for WorkspaceManagerApp {
                                                             if ui.small_button("Edit").clicked() {
                                                                 self.pending_action = PendingAction::Edit(idx);
                                                             }
+                                                            if !urls.is_empty() && ui.small_button("URLs").clicked() {
+                                                                self.pending_action = PendingAction::OpenUrl(idx, 0);
+                                                            }
                                                             ui.menu_button("⋮", |ui| {
                                                                 if ui.button("Open in Built-in Terminal").clicked() {
                                                                     self.pending_action = PendingAction::OpenBuiltinTerminal(idx);
@@ -1135,6 +1241,10 @@ impl eframe::App for WorkspaceManagerApp {
                                                                 }
                                                                 if ui.button("Open with Editor...").clicked() {
                                                                     self.pending_action = PendingAction::OpenEditor(idx);
+                                                                    ui.close_menu();
+                                                                }
+                                                                if ui.button("Manage URLs").clicked() {
+                                                                    self.dialog = DialogState::ManageUrls(idx);
                                                                     ui.close_menu();
                                                                 }
                                                                 ui.separator();
@@ -1165,6 +1275,16 @@ impl eframe::App for WorkspaceManagerApp {
             PendingAction::OpenDefault(idx) => self.open_workspace(idx, "default"),
             PendingAction::OpenFileManager(idx) => self.open_workspace(idx, "file_manager"),
             PendingAction::OpenEditor(idx) => self.show_editor_select(idx),
+            PendingAction::OpenUrl(idx, url_idx) => {
+                if let Some(ws) = self.workspaces.get(idx) {
+                    if ws.config.urls.is_empty() {
+                        self.dialog = DialogState::ManageUrls(idx);
+                    } else if let Some(url_entry) = ws.config.urls.get(url_idx) {
+                        open_url(&url_entry.url);
+                        self.message = Message::Info(format!("Opening '{}' in browser", url_entry.label));
+                    }
+                }
+            }
             PendingAction::OpenTerminal(idx) => {
                 if let Some(ws) = self.workspaces.get(idx) {
                     let folder_path = ws
@@ -1491,11 +1611,114 @@ impl eframe::App for WorkspaceManagerApp {
                         });
                     });
             }
+            DialogState::ManageUrls(index) => {
+                let idx = *index;
+                if let Some(ws) = self.workspaces.get(idx) {
+                    let name = ws.name.clone();
+                    let ws_path = ws.path.clone();
+                    let title = format!("Manage URLs: {}", name);
+                    egui::Window::new(title)
+                        .collapsible(false)
+                        .resizable(true)
+                        .default_width(550.0)
+                        .default_height(400.0)
+                        .show(ctx, |ui| {
+                            ui.vertical(|ui| {
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    ui.group(|ui| {
+                                        ui.strong("Saved URLs");
+                                        ui.add_space(5.0);
+
+                                        let urls = {
+                                            let ws_opt = self.workspaces.get(idx);
+                                            ws_opt.map(|w| w.config.urls.clone()).unwrap_or_default()
+                                        };
+                                        let mut urls_to_remove: Vec<usize> = Vec::new();
+
+                                        for (i, url_entry) in urls.iter().enumerate() {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new(if url_entry.label.is_empty() { &url_entry.url } else { &url_entry.label }).strong().size(12.0));
+                                                ui.add_space(8.0);
+                                                ui.add(egui::Label::new(egui::RichText::new(&url_entry.url).size(11.0).color(ui.visuals().weak_text_color())).truncate());
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    if ui.small_button("🌐 Launch").on_hover_text("Open in browser").clicked() {
+                                                        open_url(&url_entry.url);
+                                                        self.message = Message::Info(format!("Opening '{}' in browser", url_entry.label));
+                                                    }
+                                                    if ui.small_button("🗑").on_hover_text("Delete URL").clicked() {
+                                                        urls_to_remove.push(i);
+                                                    }
+                                                });
+                                            });
+                                            ui.add_space(4.0);
+                                        }
+
+                                        if !urls_to_remove.is_empty() {
+                                            let ws_opt = self.workspaces.get(idx);
+                                            if let Some(ws_ref) = ws_opt {
+                                                let mut config = ws_ref.config.clone();
+                                                for i in urls_to_remove.iter().rev() {
+                                                    config.urls.remove(*i);
+                                                }
+                                                if let Err(e) = update_workspace(&ws_path, &config) {
+                                                    self.message = Message::Error(e.to_string());
+                                                } else {
+                                                    self.load_workspaces();
+                                                }
+                                            }
+                                        }
+
+                                        if urls.is_empty() {
+                                            ui.label(egui::RichText::new("No URLs saved yet. Add one below.").size(11.0).color(ui.visuals().weak_text_color()));
+                                        }
+                                    });
+
+                                    ui.add_space(10.0);
+
+                                    ui.group(|ui| {
+                                        ui.strong("Add New URL");
+                                        ui.add_space(5.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label("Label:");
+                                            ui.add_sized([130.0, 20.0], egui::TextEdit::singleline(&mut self.new_url_label));
+                                            ui.label("URL:");
+                                            ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.new_url));
+                                            if ui.button("+ Add").clicked() && !self.new_url.is_empty() {
+                                                let ws_opt = self.workspaces.get(idx);
+                                                if let Some(ws_ref) = ws_opt {
+                                                    let mut config = ws_ref.config.clone();
+                                                    config.urls.push(WorkspaceUrl::new(
+                                                        self.new_url_label.clone(),
+                                                        self.new_url.clone(),
+                                                    ));
+                                                    if let Err(e) = update_workspace(&ws_path, &config) {
+                                                        self.message = Message::Error(e.to_string());
+                                                    } else {
+                                                        self.new_url_label.clear();
+                                                        self.new_url.clear();
+                                                        self.load_workspaces();
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    });
+                                });
+
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    if ui.button("Close").clicked() {
+                                        self.dialog = DialogState::None;
+                                    }
+                                });
+                            });
+                        });
+                }
+            }
             DialogState::About => {
                 egui::Window::new("About Workspace Manager")
                     .collapsible(false)
                     .resizable(false)
-                    .default_width(350.0)
+                    .default_width(380.0)
                     .show(ctx, |ui| {
                         ui.vertical(|ui| {
                             ui.centered_and_justified(|ui| {
@@ -1518,6 +1741,90 @@ impl eframe::App for WorkspaceManagerApp {
                                     ui.add_space(8.0);
                                     ui.label(egui::RichText::new(env!("CARGO_PKG_DESCRIPTION")).size(12.0).color(ui.visuals().weak_text_color()));
                                     ui.add_space(16.0);
+
+                                    ui.group(|ui| {
+                                        ui.strong("Updates");
+                                        ui.add_space(6.0);
+
+                                        let updater = self.get_updater(ctx);
+                                        let status = updater.get_status();
+
+                                        match &status {
+                                            UpdateStatus::Idle => {
+                                                if ui.button("Check for Updates").clicked() {
+                                                    updater.check_for_updates();
+                                                }
+                                            }
+                                            UpdateStatus::Checking => {
+                                                ui.horizontal(|ui| {
+                                                    ui.spinner();
+                                                    ui.label("Checking for updates...");
+                                                });
+                                            }
+                                            UpdateStatus::UpToDate => {
+                                                ui.horizontal(|ui| {
+                                                    ui.label("✅");
+                                                    ui.label("You are running the latest version.");
+                                                });
+                                                ui.add_space(4.0);
+                                                if ui.small_button("Check Again").clicked() {
+                                                    updater.reset();
+                                                    updater.check_for_updates();
+                                                }
+                                            }
+                                            UpdateStatus::UpdateAvailable { version, release_notes } => {
+                                                ui.label(egui::RichText::new(format!("New version {} available!", version)).strong().color(egui::Color32::GREEN));
+                                                ui.add_space(4.0);
+
+                                                if !release_notes.is_empty() {
+                                                    egui::ScrollArea::vertical()
+                                                        .max_height(80.0)
+                                                        .show(ui, |ui| {
+                                                            ui.label(egui::RichText::new(release_notes).size(11.0).color(ui.visuals().weak_text_color()));
+                                                        });
+                                                    ui.add_space(4.0);
+                                                }
+
+                                                ui.horizontal(|ui| {
+                                                    if ui.button("Download & Install").clicked() {
+                                                        updater.install_update();
+                                                    }
+                                                    if ui.small_button("Dismiss").clicked() {
+                                                        updater.reset();
+                                                    }
+                                                });
+                                            }
+                                            UpdateStatus::Downloading(progress) => {
+                                                ui.label("Downloading update...");
+                                                ui.add(egui::ProgressBar::new(*progress)
+                                                    .text(format!("{:.0}%", progress * 100.0)));
+                                            }
+                                            UpdateStatus::Installing => {
+                                                ui.horizontal(|ui| {
+                                                    ui.spinner();
+                                                    ui.label("Installing update...");
+                                                });
+                                            }
+                                            UpdateStatus::Success => {
+                                                ui.label("✅ Update installed! Restarting...");
+                                            }
+                                            UpdateStatus::Error(msg) => {
+                                                ui.label(egui::RichText::new(format!("Error: {}", msg)).color(ui.visuals().error_fg_color));
+                                                ui.add_space(4.0);
+                                                ui.horizontal(|ui| {
+                                                    if ui.button("Retry").clicked() {
+                                                        updater.reset();
+                                                        updater.check_for_updates();
+                                                    }
+                                                    if ui.small_button("Dismiss").clicked() {
+                                                        updater.reset();
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    });
+
+                                    ui.add_space(12.0);
                                     if ui.button("Close").clicked() {
                                         self.dialog = DialogState::None;
                                     }

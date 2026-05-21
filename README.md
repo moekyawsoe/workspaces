@@ -16,6 +16,12 @@ A cross-platform desktop application to manage `.code-workspace` files with a cl
 
 - Create, edit, and delete workspace configurations
 - Open workspaces with your preferred editor
+- **Built-in Terminal Improvements**:
+  - Full mouse-wheel scrolling and keyboard navigation (`PageUp`/`PageDown`) through the scrollback buffer
+  - Right-click context menu for Copy/Paste (prevents selection crashes and frees up shortcuts)
+  - `Ctrl+C` works as standard terminal interrupt (`SIGINT`)
+- **Auto-Updates**: Built-in self-updater checks, downloads, and installs updates seamlessly directly from GitHub Releases (across Linux `.deb`, macOS `.dmg`, and Windows `.zip`)
+- **Statically Linked Windows Build**: The Windows `.exe` statically links the VC++ Runtime (CRT), meaning it runs out-of-the-box without requiring Visual C++ Redistributable (`VCRUNTIME140.dll`)
 - Quick terminal access from workspace folders
 - Search and filter workspaces
 - Cross-platform support (Linux, macOS, Windows)

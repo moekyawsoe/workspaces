@@ -19,6 +19,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Sync Cargo.toml version
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          sed -i "s/^version = .*/version = \"$VERSION\"/" Cargo.toml
+          cat Cargo.toml
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -86,6 +92,13 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Sync Cargo.toml version
+        shell: pwsh
+        run: |
+          $VERSION = "${GITHUB_REF_NAME}" -replace "^v",""
+          (Get-Content Cargo.toml) -replace '^version = ".*"', "version = `"$VERSION`"" | Set-Content Cargo.toml
+          Get-Content Cargo.toml
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -120,6 +133,12 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Sync Cargo.toml version
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          sed -i '' "s/^version = .*/version = \"$VERSION\"/" Cargo.toml
+          cat Cargo.toml
 
       - name: Cache cargo registry
         uses: actions/cache@v4

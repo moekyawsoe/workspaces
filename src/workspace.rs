@@ -3,12 +3,31 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceFolder {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceUrl {
+    pub id: String,
+    pub label: String,
+    pub url: String,
+}
+
+impl WorkspaceUrl {
+    pub fn new(label: String, url: String) -> Self {
+        Self {
+            id: format!("url_{}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()),
+            label,
+            url,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -26,6 +45,8 @@ pub struct WorkspaceConfig {
     pub extensions: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch: Option<WorkspaceLaunch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub urls: Vec<WorkspaceUrl>,
 }
 
 #[derive(Debug, Clone)]
@@ -507,6 +528,13 @@ fn command_exists(cmd: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+pub fn open_url(url: &str) {
+    let url = url.to_string();
+    std::thread::spawn(move || {
+        let _ = open::that(&url);
+    });
 }
 
 pub fn format_size(size: u64) -> String {
