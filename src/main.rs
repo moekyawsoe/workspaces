@@ -158,6 +158,7 @@ enum PendingAction {
     OpenFileManager(usize),
     OpenEditor(usize),
     OpenTerminal(usize),
+    OpenBuiltinTerminal(usize),
     Edit(usize),
     Duplicate(usize),
     Delete(usize),
@@ -185,6 +186,7 @@ struct WorkspaceManagerApp {
     terminal_message: Option<String>,
 
     terminal_tabs: Vec<TerminalTab>,
+    floating_tabs: Vec<TerminalTab>,
     active_tab_index: usize,
     terminal_visible: bool,
     terminal_settings: TerminalSettings,
@@ -232,6 +234,7 @@ impl Default for WorkspaceManagerApp {
             selected_terminal,
             terminal_message: None,
             terminal_tabs: Vec::new(),
+            floating_tabs: Vec::new(),
             active_tab_index: 0,
             terminal_visible: false,
             terminal_settings,
@@ -316,9 +319,9 @@ impl WorkspaceManagerApp {
         }
     }
 
-    fn open_builtin_terminal(&mut self, working_dir: Option<std::path::PathBuf>) {
+    fn open_builtin_terminal(&mut self, name: Option<String>, working_dir: Option<std::path::PathBuf>) {
         if self.terminal_tabs.is_empty() {
-            self.add_terminal_tab(working_dir);
+            self.add_terminal_tab(name, working_dir);
         } else {
             self.terminal_visible = true;
         }
@@ -328,17 +331,17 @@ impl WorkspaceManagerApp {
         self.terminal_visible = false;
     }
 
-    fn toggle_builtin_terminal(&mut self, working_dir: Option<std::path::PathBuf>) {
+    fn toggle_builtin_terminal(&mut self, name: Option<String>, working_dir: Option<std::path::PathBuf>) {
         if self.terminal_visible {
             self.close_builtin_terminal();
         } else {
-            self.open_builtin_terminal(working_dir);
+            self.open_builtin_terminal(name, working_dir);
         }
     }
 
-    fn add_terminal_tab(&mut self, working_dir: Option<std::path::PathBuf>) {
-        let name = format!("Tab {}", self.terminal_tabs.len() + 1);
-        match TerminalTab::new(name, self.terminal_settings.clone(), working_dir) {
+    fn add_terminal_tab(&mut self, name: Option<String>, working_dir: Option<std::path::PathBuf>) {
+        let tab_name = name.unwrap_or_else(|| format!("Tab {}", self.terminal_tabs.len() + 1));
+        match TerminalTab::new(tab_name, self.terminal_settings.clone(), working_dir) {
             Ok(tab) => {
                 self.terminal_tabs.push(tab);
                 self.active_tab_index = self.terminal_tabs.len() - 1;
@@ -368,17 +371,26 @@ impl WorkspaceManagerApp {
         }
         let tab = &mut self.terminal_tabs[self.active_tab_index];
         if let Some(active_id) = tab.active_terminal_id {
-            let working_dir = dirs::home_dir();
+            // Try to get the current working directory from the active terminal
+            let working_dir = tab.root.find_terminal_mut(active_id)
+                .and_then(|t| t.current_working_dir())
+                .or_else(|| dirs::home_dir());
             match Terminal::new(self.terminal_settings.clone(), working_dir) {
                 Ok(new_term) => {
+                    let new_id = new_term.id;
                     let mut term_opt = Some(new_term);
                     tab.root.split(active_id, direction, &mut term_opt);
+                    tab.active_terminal_id = Some(new_id);
                 }
                 Err(e) => {
                     self.message = Message::Error(format!("Failed to split terminal: {}", e));
                 }
             }
         }
+    }
+
+    fn duplicate_active_terminal(&mut self) {
+        self.split_active_terminal(SplitDirection::Horizontal);
     }
 
     fn close_active_pane(&mut self) {
@@ -659,11 +671,127 @@ impl eframe::App for WorkspaceManagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.key_pressed(egui::Key::Backtick) && (i.modifiers.ctrl || i.modifiers.command)) {
             let working_dir = dirs::home_dir();
-            self.toggle_builtin_terminal(working_dir);
+            self.toggle_builtin_terminal(None, working_dir);
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {
             self.terminal_tabs.clear();
+            self.floating_tabs.clear();
+        }
+
+        let mut tab_to_dock = None;
+        let mut tab_to_close_float = None;
+
+        for (idx, tab) in self.floating_tabs.iter_mut().enumerate() {
+            let mut is_open = true;
+            egui::Window::new(&tab.name)
+                .open(&mut is_open)
+                .default_size(egui::vec2(700.0, 450.0))
+                .show(ctx, |ui| {
+                    ui.vertical(|ui| {
+                        // Toolbar inside the floating window
+                        ui.horizontal(|ui| {
+                            if ui.small_button("⤵ Dock").on_hover_text("Dock back to bottom panel").clicked() {
+                                tab_to_dock = Some(idx);
+                            }
+                            ui.separator();
+                            if ui.small_button("x Close Pane").on_hover_text("Close active pane").clicked() {
+                                if let Some(active_id) = tab.active_terminal_id {
+                                    let mut removed = false;
+                                    let opt_pane = tab.root.close_pane(active_id, &mut removed);
+                                    if removed {
+                                        if let Some(new_root) = opt_pane {
+                                            match new_root {
+                                                TerminalPane::Placeholder => {
+                                                    tab_to_close_float = Some(idx);
+                                                }
+                                                _ => {
+                                                    tab.root = new_root;
+                                                    tab.active_terminal_id = tab.root.any_terminal_id();
+                                                }
+                                            }
+                                        } else {
+                                            tab.active_terminal_id = tab.root.any_terminal_id();
+                                        }
+                                    }
+                                }
+                            }
+                            if ui.small_button("| Split V").on_hover_text("Split active pane vertically").clicked() {
+                                if let Some(active_id) = tab.active_terminal_id {
+                                    let working_dir = tab.root.find_terminal_mut(active_id)
+                                        .and_then(|t| t.current_working_dir())
+                                        .or_else(|| dirs::home_dir());
+                                    match Terminal::new(self.terminal_settings.clone(), working_dir) {
+                                        Ok(new_term) => {
+                                            let new_id = new_term.id;
+                                            let mut term_opt = Some(new_term);
+                                            tab.root.split(active_id, SplitDirection::Vertical, &mut term_opt);
+                                            tab.active_terminal_id = Some(new_id);
+                                        }
+                                        Err(e) => {
+                                            self.message = Message::Error(format!("Failed to split terminal: {}", e));
+                                        }
+                                    }
+                                }
+                            }
+                            if ui.small_button("| Split H").on_hover_text("Split active pane horizontally").clicked() {
+                                if let Some(active_id) = tab.active_terminal_id {
+                                    let working_dir = tab.root.find_terminal_mut(active_id)
+                                        .and_then(|t| t.current_working_dir())
+                                        .or_else(|| dirs::home_dir());
+                                    match Terminal::new(self.terminal_settings.clone(), working_dir) {
+                                        Ok(new_term) => {
+                                            let new_id = new_term.id;
+                                            let mut term_opt = Some(new_term);
+                                            tab.root.split(active_id, SplitDirection::Horizontal, &mut term_opt);
+                                            tab.active_terminal_id = Some(new_id);
+                                        }
+                                        Err(e) => {
+                                            self.message = Message::Error(format!("Failed to split terminal: {}", e));
+                                        }
+                                    }
+                                }
+                            }
+                            if ui.small_button("🗐 Duplicate").on_hover_text("Duplicate active pane").clicked() {
+                                if let Some(active_id) = tab.active_terminal_id {
+                                    let working_dir = tab.root.find_terminal_mut(active_id)
+                                        .and_then(|t| t.current_working_dir())
+                                        .or_else(|| dirs::home_dir());
+                                    match Terminal::new(self.terminal_settings.clone(), working_dir) {
+                                        Ok(new_term) => {
+                                            let new_id = new_term.id;
+                                            let mut term_opt = Some(new_term);
+                                            tab.root.split(active_id, SplitDirection::Horizontal, &mut term_opt);
+                                            tab.active_terminal_id = Some(new_id);
+                                        }
+                                        Err(e) => {
+                                            self.message = Message::Error(format!("Failed to split terminal: {}", e));
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        ui.separator();
+
+                        let active_id = &mut tab.active_terminal_id;
+                        tab.root.render(ui, active_id, ctx);
+                    });
+                });
+
+            if !is_open {
+                tab_to_close_float = Some(idx);
+            }
+        }
+
+        if let Some(idx) = tab_to_dock {
+            let tab = self.floating_tabs.remove(idx);
+            self.terminal_tabs.push(tab);
+            self.active_tab_index = self.terminal_tabs.len() - 1;
+            self.terminal_visible = true;
+        }
+
+        if let Some(idx) = tab_to_close_float {
+            self.floating_tabs.remove(idx);
         }
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
@@ -698,7 +826,7 @@ impl eframe::App for WorkspaceManagerApp {
                     let terminal_label = if self.terminal_visible { "Hide Terminal" } else { "Show Terminal" };
                     if ui.button(terminal_label).clicked() {
                         let working_dir = dirs::home_dir();
-                        self.toggle_builtin_terminal(working_dir);
+                        self.toggle_builtin_terminal(None, working_dir);
                         ui.close_menu();
                     }
                     ui.separator();
@@ -731,6 +859,7 @@ impl eframe::App for WorkspaceManagerApp {
                         ui.horizontal(|ui| {
                             // Tab list
                             let mut tab_to_close = None;
+                            let mut tab_to_float = None;
                             for (idx, tab) in self.terminal_tabs.iter().enumerate() {
                                 let is_active = idx == self.active_tab_index;
                                 ui.horizontal(|ui| {
@@ -739,18 +868,30 @@ impl eframe::App for WorkspaceManagerApp {
                                     if ui.selectable_label(is_active, text).clicked() {
                                         self.active_tab_index = idx;
                                     }
+                                    if ui.small_button("↗").on_hover_text("Float tab").clicked() {
+                                        tab_to_float = Some(idx);
+                                    }
                                     if ui.small_button("x").clicked() {
                                         tab_to_close = Some(idx);
                                     }
                                 });
                                 ui.add_space(8.0);
                             }
+                            if let Some(idx) = tab_to_float {
+                                let tab = self.terminal_tabs.remove(idx);
+                                self.floating_tabs.push(tab);
+                                if self.terminal_tabs.is_empty() {
+                                    self.terminal_visible = false;
+                                } else if self.active_tab_index >= self.terminal_tabs.len() {
+                                    self.active_tab_index = self.terminal_tabs.len() - 1;
+                                }
+                            }
                             if let Some(idx) = tab_to_close {
                                 self.close_tab(idx);
                             }
                             if ui.button("+").on_hover_text("New Tab").clicked() {
                                 let working_dir = dirs::home_dir();
-                                self.add_terminal_tab(working_dir);
+                                self.add_terminal_tab(None, working_dir);
                             }
                             
                             // Controls on the right
@@ -770,6 +911,21 @@ impl eframe::App for WorkspaceManagerApp {
                                 }
                                 if ui.small_button("| Split H").on_hover_text("Split active pane horizontally").clicked() {
                                     self.split_active_terminal(SplitDirection::Horizontal);
+                                }
+                                if ui.small_button("🗐 Duplicate").on_hover_text("Duplicate active pane").clicked() {
+                                    self.duplicate_active_terminal();
+                                }
+                                if ui.small_button("↗ Float Tab").on_hover_text("Float current tab").clicked() {
+                                    if !self.terminal_tabs.is_empty() {
+                                        let idx = self.active_tab_index;
+                                        let tab = self.terminal_tabs.remove(idx);
+                                        self.floating_tabs.push(tab);
+                                        if self.terminal_tabs.is_empty() {
+                                            self.terminal_visible = false;
+                                        } else if self.active_tab_index >= self.terminal_tabs.len() {
+                                            self.active_tab_index = self.terminal_tabs.len() - 1;
+                                        }
+                                    }
                                 }
                             });
                         });
@@ -969,6 +1125,10 @@ impl eframe::App for WorkspaceManagerApp {
                                                                 self.pending_action = PendingAction::Edit(idx);
                                                             }
                                                             ui.menu_button("⋮", |ui| {
+                                                                if ui.button("Open in Built-in Terminal").clicked() {
+                                                                    self.pending_action = PendingAction::OpenBuiltinTerminal(idx);
+                                                                    ui.close_menu();
+                                                                }
                                                                 if ui.button("Open in File Manager").clicked() {
                                                                     self.pending_action = PendingAction::OpenFileManager(idx);
                                                                     ui.close_menu();
@@ -1014,6 +1174,17 @@ impl eframe::App for WorkspaceManagerApp {
                         .map(|f| std::path::PathBuf::from(&f.path))
                         .unwrap_or_else(|| ws.path.parent().unwrap_or(&ws.path).to_path_buf());
                     self.open_system_terminal(folder_path);
+                }
+            }
+            PendingAction::OpenBuiltinTerminal(idx) => {
+                if let Some(ws) = self.workspaces.get(idx) {
+                    let folder_path = ws
+                        .config
+                        .folders
+                        .first()
+                        .map(|f| std::path::PathBuf::from(&f.path))
+                        .unwrap_or_else(|| ws.path.parent().unwrap_or(&ws.path).to_path_buf());
+                    self.add_terminal_tab(Some(ws.name.clone()), Some(folder_path));
                 }
             }
             PendingAction::Edit(idx) => self.show_edit_dialog(idx),
@@ -1297,6 +1468,9 @@ impl eframe::App for WorkspaceManagerApp {
                                     for tab in &mut self.terminal_tabs {
                                         tab.root.update_settings(&self.terminal_settings);
                                     }
+                                    for tab in &mut self.floating_tabs {
+                                        tab.root.update_settings(&self.terminal_settings);
+                                    }
                                     self.dialog = DialogState::None;
                                 }
                                 if ui.button("Reset").clicked() {
@@ -1304,6 +1478,9 @@ impl eframe::App for WorkspaceManagerApp {
                                     save_terminal_settings(&self.terminal_settings);
                                     apply_font(ctx, &self.terminal_settings.font.family, &self.discovered_fonts);
                                     for tab in &mut self.terminal_tabs {
+                                        tab.root.update_settings(&self.terminal_settings);
+                                    }
+                                    for tab in &mut self.floating_tabs {
                                         tab.root.update_settings(&self.terminal_settings);
                                     }
                                 }

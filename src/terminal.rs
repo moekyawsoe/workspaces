@@ -189,6 +189,8 @@ pub struct TerminalState {
     pub scroll_offset: i32,
     pub cursor_visible: bool,
     pub ctx: Option<egui::Context>,
+    pub selection_start: Option<(usize, usize)>,
+    pub selection_end: Option<(usize, usize)>,
 }
 
 struct VteHandler {
@@ -812,6 +814,7 @@ pub struct Terminal {
     running: Arc<Mutex<bool>>,
     _child: Option<Box<dyn Child + Send + Sync>>,
     pub id: usize,
+    pub working_dir: Option<std::path::PathBuf>,
 }
 
 static NEXT_TERMINAL_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -831,7 +834,8 @@ impl Terminal {
         };
 
         let mut cmd = CommandBuilder::new(&shell);
-        cmd.cwd(working_dir.unwrap_or_else(|| dirs::home_dir().unwrap_or_default()));
+        let cwd_path = working_dir.clone().unwrap_or_else(|| dirs::home_dir().unwrap_or_default());
+        cmd.cwd(cwd_path);
 
         // Inherit parent environment variables
         for (key, val) in std::env::vars() {
@@ -894,6 +898,8 @@ impl Terminal {
             scroll_offset: 0,
             cursor_visible: true,
             ctx: None,
+            selection_start: None,
+            selection_end: None,
         }));
 
         let running = Arc::new(Mutex::new(true));
@@ -936,6 +942,7 @@ impl Terminal {
             running,
             _child: Some(child),
             id,
+            working_dir,
         })
     }
 
@@ -1012,6 +1019,99 @@ impl Terminal {
     pub fn get_state(&self) -> TerminalState {
         self.state.lock().clone()
     }
+
+    pub fn set_selection(&self, start: (usize, usize), end: (usize, usize)) {
+        let mut state = self.state.lock();
+        state.selection_start = Some(start);
+        state.selection_end = Some(end);
+    }
+
+    pub fn clear_selection(&self) {
+        let mut state = self.state.lock();
+        state.selection_start = None;
+        state.selection_end = None;
+    }
+
+    pub fn current_working_dir(&self) -> Option<std::path::PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(child) = &self._child {
+                if let Some(pid) = child.process_id() {
+                    let proc_path = format!("/proc/{}/cwd", pid);
+                    if let Ok(cwd) = std::fs::read_link(proc_path) {
+                        return Some(cwd);
+                    }
+                }
+            }
+        }
+        self.working_dir.clone()
+    }
+}
+
+impl TerminalState {
+    pub fn line_count(&self) -> usize {
+        self.scrollback.len() + self.grid.len()
+    }
+
+    pub fn get_line(&self, idx: usize) -> Option<&Vec<Cell>> {
+        if idx < self.scrollback.len() {
+            Some(&self.scrollback[idx])
+        } else {
+            let grid_idx = idx - self.scrollback.len();
+            if grid_idx < self.grid.len() {
+                Some(&self.grid[grid_idx])
+            } else {
+                None
+            }
+        }
+    }
+
+    pub fn get_selected_text(&self) -> Option<String> {
+        let start = self.selection_start?;
+        let end = self.selection_end?;
+        if start == end {
+            return None;
+        }
+
+        let (p1, p2) = if start.0 < end.0 || (start.0 == end.0 && start.1 <= end.1) {
+            (start, end)
+        } else {
+            (end, start)
+        };
+
+        let mut selected_text = String::new();
+        for r in p1.0..=p2.0 {
+            if let Some(line) = self.get_line(r) {
+                let start_c = if r == p1.0 { p1.1 } else { 0 };
+                let end_c = if r == p2.0 { p2.1.min(line.len().saturating_sub(1)) } else { line.len().saturating_sub(1) };
+
+                let mut line_str = String::new();
+                for c in start_c..=end_c {
+                    if c < line.len() {
+                        let cell = &line[c];
+                        if cell.ch.is_empty() || cell.ch == "\0" || cell.ch == "\x00" {
+                            line_str.push(' ');
+                        } else {
+                            line_str.push_str(&cell.ch);
+                        }
+                    }
+                }
+
+                let trimmed = line_str.trim_end();
+                selected_text.push_str(trimmed);
+
+                if r < p2.0 {
+                    selected_text.push('\n');
+                }
+            }
+        }
+
+        if selected_text.is_empty() {
+            None
+        } else {
+            Some(selected_text)
+        }
+    }
 }
 
 impl Drop for Terminal {
@@ -1036,7 +1136,7 @@ impl<'a> TerminalWidget<'a> {
 
 impl egui::Widget for TerminalWidget<'_> {
     fn ui(self, ui: &mut egui::Ui) -> egui::Response {
-        let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click());
+        let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
 
         let font_size = self.terminal.settings.font.size;
         let char_width = font_size * 0.6;
@@ -1059,45 +1159,130 @@ impl egui::Widget for TerminalWidget<'_> {
 
         painter.rect_filled(response.rect, 0.0, theme.background);
 
-        let scroll_offset = self.terminal.scroll_offset;
-        let display_start = if scroll_offset < 0 {
-            (-scroll_offset) as usize
-        } else {
-            0
+        // Mouse wheel scrolling
+        if response.hovered() {
+            let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
+            if scroll_delta != 0.0 {
+                let lines = if scroll_delta > 0.0 { 3i32 } else { -3i32 };
+                let max_back = -(state.scrollback.len() as i32);
+                self.terminal.scroll_offset = (self.terminal.scroll_offset - lines).clamp(max_back, 0);
+            }
+        }
+
+        // Calculate view window into virtual buffer (scrollback + grid)
+        // scroll_offset: 0 = at bottom, negative = scrolled up into history
+        let sb_len = state.scrollback.len();
+        let view_start = (sb_len as i32 + self.terminal.scroll_offset).max(0) as usize;
+
+        // --- Mouse drag selection handling ---
+        // Convert pixel position to (absolute_row, col) where absolute_row is index into scrollback+grid
+        let pos_to_cell = |pos: egui::Pos2| -> Option<(usize, usize)> {
+            let relative_x = pos.x - response.rect.min.x;
+            let relative_y = pos.y - response.rect.min.y;
+            if relative_x >= 0.0 && relative_y >= 0.0 {
+                let col = (relative_x / char_width) as usize;
+                let screen_row = (relative_y / line_height) as usize;
+                let col = col.min(cols.saturating_sub(1));
+                let screen_row = screen_row.min(rows.saturating_sub(1));
+                // Convert screen row to absolute row (in scrollback+grid space)
+                let abs_row = view_start + screen_row;
+                Some((abs_row, col))
+            } else {
+                None
+            }
         };
 
-        // Pass 1: Draw cell backgrounds
-        for row in 0..self.terminal.rows {
-            let grid_row = row + display_start;
-            if grid_row >= state.grid.len() {
-                break;
-            }
-            for col in 0..self.terminal.cols {
-                if col >= state.grid[grid_row].len() {
-                    break;
+        if response.drag_started() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if let Some(cell) = pos_to_cell(pos) {
+                    self.terminal.set_selection(cell, cell);
                 }
+            }
+        } else if response.dragged() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if let Some(cell) = pos_to_cell(pos) {
+                    // Update only end
+                    let current_state = self.terminal.get_state();
+                    if let Some(start) = current_state.selection_start {
+                        self.terminal.set_selection(start, cell);
+                    }
+                }
+            }
+        } else if response.clicked() && !response.dragged() {
+            // Simple click clears selection
+            self.terminal.clear_selection();
+        }
 
-                let cell = &state.grid[grid_row][col];
-                if cell.bg != theme.background && cell.bg != egui::Color32::TRANSPARENT {
+        // Re-read state after potential selection changes
+        let state = self.terminal.get_state();
+        let sb_len = state.scrollback.len();
+
+        // Helper to check if a cell (absolute_row, col) is selected
+        let is_cell_selected = |abs_row: usize, col: usize| -> bool {
+            if let (Some(start), Some(end)) = (state.selection_start, state.selection_end) {
+                if start == end {
+                    return false;
+                }
+                let (p1, p2) = if start.0 < end.0 || (start.0 == end.0 && start.1 <= end.1) {
+                    (start, end)
+                } else {
+                    (end, start)
+                };
+                if abs_row < p1.0 || abs_row > p2.0 {
+                    return false;
+                }
+                if abs_row == p1.0 && abs_row == p2.0 {
+                    return col >= p1.1 && col <= p2.1;
+                }
+                if abs_row == p1.0 {
+                    return col >= p1.1;
+                }
+                if abs_row == p2.0 {
+                    return col <= p2.1;
+                }
+                true
+            } else {
+                false
+            }
+        };
+
+        // Pass 1: Draw cell backgrounds + selection highlights
+        for row in 0..self.terminal.rows {
+            let abs_row = view_start + row;
+            let line = match state.get_line(abs_row) {
+                Some(l) => l,
+                None => break,
+            };
+            for col in 0..self.terminal.cols.min(line.len()) {
+                let cell = &line[col];
+                let selected = is_cell_selected(abs_row, col);
+
+                let has_bg = cell.bg != theme.background && cell.bg != egui::Color32::TRANSPARENT;
+
+                if selected || has_bg {
                     let x = response.rect.min.x + col as f32 * char_width;
                     let y = response.rect.min.y + row as f32 * line_height;
                     let cell_rect = egui::Rect::from_min_size(
                         egui::Pos2::new(x, y),
                         egui::Vec2::new(char_width, line_height),
                     );
-                    painter.rect_filled(cell_rect, 0.0, cell.bg);
+                    if has_bg {
+                        painter.rect_filled(cell_rect, 0.0, cell.bg);
+                    }
+                    if selected {
+                        painter.rect_filled(cell_rect, 0.0, theme.selection);
+                    }
                 }
             }
         }
 
         // Pass 2: Draw text runs (grouping contiguous styled characters)
         for row in 0..self.terminal.rows {
-            let grid_row = row + display_start;
-            if grid_row >= state.grid.len() {
-                break;
-            }
-
-            let row_cells = &state.grid[grid_row];
+            let abs_row = view_start + row;
+            let row_cells = match state.get_line(abs_row) {
+                Some(l) => l,
+                None => break,
+            };
             let cols_limit = row_cells.len().min(self.terminal.cols);
 
             // Find the last column index that contains a non-empty, non-space character
@@ -1183,47 +1368,158 @@ impl egui::Widget for TerminalWidget<'_> {
         }
 
         if self.terminal.cursor_visible {
-            let cursor_y = state.cursor_y.saturating_sub(display_start);
-            if cursor_y < self.terminal.rows {
-                let cursor_x = state.cursor_x;
-                if cursor_x < self.terminal.cols {
-                    let cursor_x_pos = response.rect.min.x + cursor_x as f32 * char_width;
-                    let cursor_y_pos = response.rect.min.y + cursor_y as f32 * line_height;
-                    let cursor_rect = egui::Rect::from_min_size(
-                        egui::Pos2::new(cursor_x_pos, cursor_y_pos),
-                        egui::Vec2::new(char_width, line_height),
-                    );
+            let cursor_abs = sb_len + state.cursor_y;
+            if cursor_abs >= view_start {
+                let cursor_screen_row = cursor_abs - view_start;
+                if cursor_screen_row < self.terminal.rows {
+                    let cursor_x = state.cursor_x;
+                    if cursor_x < self.terminal.cols {
+                        let cursor_x_pos = response.rect.min.x + cursor_x as f32 * char_width;
+                        let cursor_y_pos = response.rect.min.y + cursor_screen_row as f32 * line_height;
+                        let cursor_rect = egui::Rect::from_min_size(
+                            egui::Pos2::new(cursor_x_pos, cursor_y_pos),
+                            egui::Vec2::new(char_width, line_height),
+                        );
 
-                    let has_focus = response.has_focus();
-                    if has_focus {
-                        painter.rect_filled(cursor_rect, 1.0, theme.cursor);
+                        let has_focus = response.has_focus();
+                        if has_focus {
+                            painter.rect_filled(cursor_rect, 1.0, theme.cursor);
 
-                        // Draw character under cursor in cursor_text color
-                        let grid_row = cursor_y + display_start;
-                        if grid_row < state.grid.len() && cursor_x < state.grid[grid_row].len() {
-                            let cell = &state.grid[grid_row][cursor_x];
-                            let cell_ch = if cell.ch.is_empty() || cell.ch == "\0" || cell.ch == "\x00" {
-                                ""
-                            } else {
-                                &cell.ch
-                            };
-                            if !cell_ch.is_empty() {
-                                painter.text(
-                                    egui::Pos2::new(cursor_x_pos, cursor_y_pos + line_height * 0.5),
-                                    egui::Align2::LEFT_CENTER,
-                                    cell_ch,
-                                    egui::FontId::monospace(font_size),
-                                    theme.cursor_text,
-                                );
+                            // Draw character under cursor in cursor_text color
+                            if state.cursor_y < state.grid.len() && cursor_x < state.grid[state.cursor_y].len() {
+                                let cell = &state.grid[state.cursor_y][cursor_x];
+                                let cell_ch = if cell.ch.is_empty() || cell.ch == "\0" || cell.ch == "\x00" {
+                                    ""
+                                } else {
+                                    &cell.ch
+                                };
+                                if !cell_ch.is_empty() {
+                                    painter.text(
+                                        egui::Pos2::new(cursor_x_pos, cursor_y_pos + line_height * 0.5),
+                                        egui::Align2::LEFT_CENTER,
+                                        cell_ch,
+                                        egui::FontId::monospace(font_size),
+                                        theme.cursor_text,
+                                    );
+                                }
                             }
+                        } else {
+                            // Hollow outline cursor when unfocused
+                            painter.rect_stroke(cursor_rect, 1.0, egui::Stroke::new(1.0, theme.cursor));
                         }
-                    } else {
-                        // Hollow outline cursor when unfocused
-                        painter.rect_stroke(cursor_rect, 1.0, egui::Stroke::new(1.0, theme.cursor));
                     }
                 }
             }
         }
+
+        // URL detection and hover/click handling
+        let ctrl_pressed = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+        let mut clicked_url = None;
+        let hover_pos = response.hover_pos();
+        let hovered_cell = hover_pos.and_then(|pos| {
+            let relative_x = pos.x - response.rect.min.x;
+            let relative_y = pos.y - response.rect.min.y;
+            if relative_x >= 0.0 && relative_y >= 0.0 {
+                let col = (relative_x / char_width) as usize;
+                let row = (relative_y / line_height) as usize;
+                if col < self.terminal.cols && row < self.terminal.rows {
+                    Some((row, col))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+
+        for row in 0..self.terminal.rows {
+            let abs_row = view_start + row;
+            let row_cells = match state.get_line(abs_row) {
+                Some(l) => l,
+                None => break,
+            };
+            let cols_limit = row_cells.len().min(self.terminal.cols);
+
+            let mut line_text = String::new();
+            let mut col_mapping = Vec::new();
+
+            for col in 0..cols_limit {
+                let cell = &row_cells[col];
+                let cell_ch = if cell.ch.is_empty() || cell.ch == "\0" || cell.ch == "\x00" {
+                    " "
+                } else {
+                    &cell.ch
+                };
+                let start_byte = line_text.len();
+                line_text.push_str(cell_ch);
+                let end_byte = line_text.len();
+                for _ in start_byte..end_byte {
+                    col_mapping.push(col);
+                }
+            }
+
+            let urls = find_urls(&line_text);
+            for (url, range) in urls {
+                if range.start < col_mapping.len() && range.end <= col_mapping.len() {
+                    let start_col = col_mapping[range.start];
+                    let end_col = if range.end > 0 {
+                        col_mapping[range.end - 1].saturating_add(1).min(self.terminal.cols)
+                    } else {
+                        0
+                    };
+
+                    let is_hovered = if let Some((h_row, h_col)) = hovered_cell {
+                        h_row == row && h_col >= start_col && h_col < end_col
+                    } else {
+                        false
+                    };
+
+                    if is_hovered {
+                        if ctrl_pressed {
+                            // Underline the URL
+                            let x_start = response.rect.min.x + start_col as f32 * char_width;
+                            let x_end = response.rect.min.x + end_col as f32 * char_width;
+                            let y_underline = response.rect.min.y + row as f32 * line_height + line_height * 0.9;
+                            painter.line_segment(
+                                [egui::pos2(x_start, y_underline), egui::pos2(x_end, y_underline)],
+                                egui::Stroke::new(1.0, theme.foreground),
+                            );
+
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+
+                            if response.clicked() {
+                                clicked_url = Some(url.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(url) = clicked_url {
+            let _ = open::that(&url);
+        }
+
+        // Right-click context menu for Copy / Paste
+        let has_selection = state.get_selected_text().is_some();
+        response.context_menu(|ui| {
+            let copy_label = if has_selection { "📋 Copy" } else { "📋 Copy (no selection)" };
+            if ui.add_enabled(has_selection, egui::Button::new(copy_label)).clicked() {
+                if let Some(text) = state.get_selected_text() {
+                    ui.ctx().output_mut(|o| o.copied_text = text);
+                    self.terminal.clear_selection();
+                }
+                ui.close_menu();
+            }
+            if ui.button("📌 Paste").clicked() {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    if let Ok(text) = clipboard.get_text() {
+                        self.terminal.paste(&text);
+                    }
+                }
+                ui.close_menu();
+            }
+        });
 
         if response.clicked() {
             response.request_focus();
@@ -1231,9 +1527,9 @@ impl egui::Widget for TerminalWidget<'_> {
 
         if response.has_focus() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::IMEAllowed(true));
-            let cursor_y = state.cursor_y.saturating_sub(display_start);
+            let cursor_screen_y = (sb_len + state.cursor_y).saturating_sub(view_start);
             let cursor_x_pos = response.rect.min.x + state.cursor_x as f32 * char_width;
-            let cursor_y_pos = response.rect.min.y + cursor_y as f32 * line_height;
+            let cursor_y_pos = response.rect.min.y + cursor_screen_y as f32 * line_height;
             let ime_rect = egui::Rect::from_min_size(
                 egui::Pos2::new(cursor_x_pos, cursor_y_pos),
                 egui::Vec2::new(char_width, line_height),
@@ -1292,6 +1588,78 @@ impl egui::Widget for TerminalWidget<'_> {
     }
 }
 
+fn find_urls(text: &str) -> Vec<(String, std::ops::Range<usize>)> {
+    let mut urls = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let http_pos = text[start..].find("http://");
+        let https_pos = text[start..].find("https://");
+        let next_pos = match (http_pos, https_pos) {
+            (Some(p1), Some(p2)) => Some(p1.min(p2)),
+            (Some(p), None) => Some(p),
+            (None, Some(p)) => Some(p),
+            (None, None) => None,
+        };
+
+        let pos = match next_pos {
+            Some(p) => p,
+            None => break,
+        };
+
+        let abs_pos = start + pos;
+        let mut end = abs_pos;
+        let bytes = text.as_bytes();
+        while end < bytes.len() {
+            let c = bytes[end] as char;
+            if c.is_ascii_whitespace()
+                || c == '"'
+                || c == '\''
+                || c == '`'
+                || c == '<'
+                || c == '>'
+                || c == '{'
+                || c == '}'
+                || c == '['
+                || c == ']'
+                || c == '\\'
+            {
+                break;
+            }
+            end += 1;
+        }
+
+        // Strip trailing punctuation
+        let mut actual_end = end;
+        while actual_end > abs_pos {
+            let last_char = bytes[actual_end - 1] as char;
+            if last_char == '.'
+                || last_char == ','
+                || last_char == ';'
+                || last_char == ':'
+                || last_char == '?'
+                || last_char == '!'
+                || last_char == ')'
+                || last_char == ']'
+                || last_char == '"'
+                || last_char == '\''
+            {
+                actual_end -= 1;
+            } else {
+                break;
+            }
+        }
+
+        if actual_end > abs_pos + 7 {
+            let url = text[abs_pos..actual_end].to_string();
+            urls.push((url, abs_pos..actual_end));
+        }
+
+        start = end.max(abs_pos + 1);
+    }
+    urls
+}
+
+
 fn handle_key_event(terminal: &mut Terminal, key: egui::Key, modifiers: &egui::Modifiers) {
     let ctrl = modifiers.ctrl || modifiers.command;
     let shift = modifiers.shift;
@@ -1317,12 +1685,12 @@ fn handle_key_event(terminal: &mut Terminal, key: egui::Key, modifiers: &egui::M
         (egui::Key::End, _, _) => b"\x1b[F".to_vec(),
         (egui::Key::PageUp, false, false) => b"\x1b[5~".to_vec(),
         (egui::Key::PageUp, true, _) => {
-            terminal.scroll(10);
+            terminal.scroll(-10);
             return;
         }
         (egui::Key::PageDown, false, false) => b"\x1b[6~".to_vec(),
         (egui::Key::PageDown, true, _) => {
-            terminal.scroll(-10);
+            terminal.scroll(10);
             return;
         }
         (egui::Key::Delete, _, _) => b"\x1b[3~".to_vec(),
@@ -1721,6 +2089,8 @@ mod tests {
             scroll_offset: 0,
             cursor_visible: true,
             ctx: None,
+            selection_start: None,
+            selection_end: None,
         }));
         let mut handler = VteHandler::new(state, TerminalTheme::default(), 80, 24);
         let mut parser = vte::Parser::new();
@@ -1748,6 +2118,8 @@ mod tests {
             scroll_offset: 0,
             cursor_visible: true,
             ctx: None,
+            selection_start: None,
+            selection_end: None,
         }));
         let mut handler = VteHandler::new(state.clone(), TerminalTheme::default(), 80, 24);
         let mut parser = vte::Parser::new();
@@ -1824,6 +2196,8 @@ mod tests {
             scroll_offset: 0,
             cursor_visible: true,
             ctx: None,
+            selection_start: None,
+            selection_end: None,
         }));
         let mut handler = VteHandler::new(state.clone(), TerminalTheme::default(), 80, 24);
         let mut parser = vte::Parser::new();
@@ -1845,6 +2219,27 @@ mod tests {
         for col in 0..15 {
             println!("Col {}: {:?}", col, s.grid[0][col].ch);
         }
+    }
+
+    #[test]
+    fn test_ctrl_c_sends_etx() {
+        let settings = TerminalSettings::default();
+        let mut terminal = Terminal::new(settings, None).unwrap();
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            ..egui::Modifiers::NONE
+        };
+        handle_key_event(&mut terminal, egui::Key::C, &modifiers);
+    }
+
+    #[test]
+    fn test_find_urls() {
+        let text = "Check out http://localhost:3002/ or https://google.com/search?q=rust. Also (http://example.com/test).";
+        let urls = find_urls(text);
+        assert_eq!(urls.len(), 3);
+        assert_eq!(urls[0].0, "http://localhost:3002/");
+        assert_eq!(urls[1].0, "https://google.com/search?q=rust");
+        assert_eq!(urls[2].0, "http://example.com/test");
     }
 }
 
