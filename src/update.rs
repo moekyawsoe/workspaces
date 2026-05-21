@@ -291,7 +291,7 @@ fn install_binary(download_path: &PathBuf) -> Result<(), Box<dyn std::error::Err
 #[cfg(target_os = "linux")]
 fn install_linux(download_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let magic = std::fs::read(download_path)?;
-    if magic.len() < 7 || &magic[..7] != b"!<arch>\n" {
+    if !magic.starts_with(b"!<arch>\n") {
         let preview = String::from_utf8_lossy(&magic[..magic.len().min(200)]);
         return Err(format!(
             "Downloaded file is not a valid .deb archive. First bytes: {}",
