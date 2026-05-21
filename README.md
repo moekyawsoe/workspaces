@@ -12,6 +12,10 @@ A cross-platform desktop application to manage `.code-workspace` files with a cl
   <img src="screenshot.png" alt="Workspace Manager Screenshot" width="800">
 </p>
 
+<p align="center">
+  <img src="screenshot2.png" alt="Workspace Manager Screenshot 2" width="800">
+</p>
+
 ## Features
 
 - Create, edit, and delete workspace configurations
