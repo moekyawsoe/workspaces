@@ -111,20 +111,29 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-      - name: Create .zip archive
+      - name: Create WiX MSI Installer & .zip archive
         shell: pwsh
         run: |
           $VERSION = $env:GITHUB_REF_NAME -replace "^v",""
           $BUILD_DIR = "build\windows"
           New-Item -ItemType Directory -Force -Path $BUILD_DIR
           Copy-Item "target\release\workspace-manager.exe" "$BUILD_DIR\workspace-manager.exe"
+          
+          # Add WiX bin directory to path and compile/link
+          $env:PATH += ";C:\Program Files (x86)\WiX Toolset v3.11\bin"
+          candle.exe -out "$BUILD_DIR\workspace-manager.wixobj" wix\workspace-manager.wxs
+          light.exe -out "$BUILD_DIR\workspace-manager-$VERSION-windows.msi" "$BUILD_DIR\workspace-manager.wixobj"
+          
+          # Compress to zip
           Compress-Archive -Path "$BUILD_DIR\workspace-manager.exe" -DestinationPath "$BUILD_DIR\workspace-manager-$VERSION-windows.zip"
 
-      - name: Upload .exe artifact
+      - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: workspace-manager-windows
-          path: build/windows/*.zip
+          path: |
+            build/windows/*.zip
+            build/windows/*.msi
 
   build-macos:
     runs-on: macos-latest
@@ -235,4 +244,5 @@ jobs:
           files: |
             artifacts/workspace-manager-linux/*.deb
             artifacts/workspace-manager-windows/*.zip
+            artifacts/workspace-manager-windows/*.msi
             artifacts/workspace-manager-macos/*.dmg

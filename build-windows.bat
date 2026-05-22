@@ -9,7 +9,7 @@ if %errorlevel% neq 0 (
 )
 
 echo.
-echo Creating installer...
+echo Preparing build directory...
 
 set APP_NAME=workspace-manager
 set VERSION=0.1.0
@@ -29,9 +29,24 @@ if exist target\release\%APP_NAME%.exe (
 )
 
 echo.
-echo To create a proper installer, use one of:
-echo   - Inno Setup
-echo   - NSIS
-echo   - WiX Toolset
-echo.
-echo Or use cargo-wix: cargo install cargo-wix ^&^& cargo wix
+echo === Packaging Windows Installer (.msi) ===
+
+set WIX_DIR=C:\Program Files (x86)\WiX Toolset v3.11\bin
+if exist "%WIX_DIR%\candle.exe" (
+    echo WiX Toolset found. Compiling installer...
+    "%WIX_DIR%\candle.exe" -out "%BUILD_DIR%\workspace-manager.wixobj" wix\workspace-manager.wxs
+    if %errorlevel% equ 0 (
+        echo Linking installer...
+        "%WIX_DIR%\light.exe" -out "%BUILD_DIR%\workspace-manager-%VERSION%-windows.msi" "%BUILD_DIR%\workspace-manager.wixobj"
+        if %errorlevel% equ 0 (
+            echo ✓ MSI Installer created: %BUILD_DIR%\workspace-manager-%VERSION%-windows.msi
+        ) else (
+            echo × WiX Linker (light.exe) failed.
+        )
+    ) else (
+        echo × WiX Compiler (candle.exe) failed.
+    )
+) else (
+    echo WiX Toolset v3.11 was not found at default path: %WIX_DIR%
+    echo Please install WiX Toolset v3.11 to package into .msi automatically.
+)

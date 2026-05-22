@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" 
+           Name="Workspace Manager" 
+           Language="1033" 
+           Version="0.1.0" 
+           Manufacturer="Moe Kyaw Soe" 
+           UpgradeCode="DE021966-E02C-4C67-B9C0-74548480E138">
+           
+    <Package InstallerVersion="200" 
+             Compressed="yes" 
+             InstallScope="perMachine" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Directory Structure -->
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFilesFolder">
+        <Directory Id="INSTALLDIR" Name="Workspace Manager" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="Workspace Manager" />
+      </Directory>
+      <Directory Id="DesktopFolder" Name="Desktop" />
+    </Directory>
+
+    <!-- Components to install -->
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="MainExecutable" Guid="A76F32A3-D19C-4CD8-87FA-BD3EDCF4B751">
+        <File Id="WorkspaceManagerExe" 
+              Source="build\windows\workspace-manager.exe" 
+              KeyPath="yes">
+          <!-- Start Menu Shortcut -->
+          <Shortcut Id="StartMenuShortcut"
+                    Directory="ApplicationProgramsFolder"
+                    Name="Workspace Manager"
+                    WorkingDirectory="INSTALLDIR"
+                    Advertise="yes" />
+          <!-- Desktop Shortcut -->
+          <Shortcut Id="DesktopShortcut"
+                    Directory="DesktopFolder"
+                    Name="Workspace Manager"
+                    WorkingDirectory="INSTALLDIR"
+                    Advertise="yes" />
+        </File>
+      </Component>
+    </DirectoryRef>
+
+    <!-- Clean up shortcuts during uninstall -->
+    <DirectoryRef Id="ApplicationProgramsFolder">
+      <Component Id="ApplicationShortcut" Guid="C19F68B6-733B-4DDF-A405-A7B8BD309F21">
+        <RemoveFolder Id="CleanUpShortcuts" On="uninstall" />
+        <RegistryValue Root="HKCU" 
+                       Key="Software\MoeKyawSoe\WorkspaceManager" 
+                       Name="installed" 
+                       Type="integer" 
+                       Value="1" 
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Features -->
+    <Feature Id="Complete" Title="Workspace Manager" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="ApplicationShortcut" />
+    </Feature>
+
+  </Product>
+</Wix>

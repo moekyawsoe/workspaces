@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use portable_pty::{Child, CommandBuilder, NativePtySystem, PtySize, PtySystem, MasterPty};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use vte::{Params, Perform};
@@ -181,7 +182,7 @@ impl Default for Cell {
 #[allow(dead_code)]
 pub struct TerminalState {
     pub grid: Vec<Vec<Cell>>,
-    pub scrollback: Vec<Vec<Cell>>,
+    pub scrollback: VecDeque<Vec<Cell>>,
     pub cursor_x: usize,
     pub cursor_y: usize,
     pub cols: usize,
@@ -193,31 +194,25 @@ pub struct TerminalState {
     pub selection_end: Option<(usize, usize)>,
 }
 
-struct VteHandler {
-    state: Arc<Mutex<TerminalState>>,
-    theme: TerminalTheme,
-    current_fg: egui::Color32,
-    current_bg: egui::Color32,
-    bold: bool,
-    italic: bool,
-    underline: bool,
-    dim: bool,
-    inverse: bool,
-    cursor_x: usize,
-    cursor_y: usize,
-    cols: usize,
-    rows: usize,
-    scroll_top: usize,
-    scroll_bottom: usize,
-    pending_char: Option<char>,
+pub struct ParserState {
+    pub theme: TerminalTheme,
+    pub current_fg: egui::Color32,
+    pub current_bg: egui::Color32,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub dim: bool,
+    pub inverse: bool,
+    pub scroll_top: usize,
+    pub scroll_bottom: usize,
+    pub pending_char: Option<char>,
 }
 
-impl VteHandler {
-    fn new(state: Arc<Mutex<TerminalState>>, theme: TerminalTheme, cols: usize, rows: usize) -> Self {
+impl ParserState {
+    pub fn new(theme: TerminalTheme, _cols: usize, rows: usize) -> Self {
         let current_fg = theme.foreground;
         let current_bg = theme.background;
         Self {
-            state,
             theme,
             current_fg,
             current_bg,
@@ -226,102 +221,116 @@ impl VteHandler {
             underline: false,
             dim: false,
             inverse: false,
-            cursor_x: 0,
-            cursor_y: 0,
-            cols,
-            rows,
             scroll_top: 0,
             scroll_bottom: rows,
             pending_char: None,
         }
     }
+}
 
-    fn sync_dimensions(&mut self, cols: usize, rows: usize) {
-        self.cols = cols;
-        self.rows = rows;
-        self.scroll_top = self.scroll_top.min(self.rows);
-        self.scroll_bottom = self.scroll_bottom.clamp(self.scroll_top, self.rows);
-        self.cursor_x = self.cursor_x.min(self.cols);
-        self.cursor_y = self.cursor_y.min(self.rows.saturating_sub(1));
+struct VteHandler<'a> {
+    state: &'a mut TerminalState,
+    parser_state: &'a mut ParserState,
+}
+
+impl<'a> VteHandler<'a> {
+    fn new(state: &'a mut TerminalState, parser_state: &'a mut ParserState) -> Self {
+        let mut handler = Self {
+            state,
+            parser_state,
+        };
+        handler.sync_dimensions();
+        handler
+    }
+
+    fn sync_dimensions(&mut self) {
+        let cols = self.state.cols;
+        let rows = self.state.rows;
+        self.parser_state.scroll_top = self.parser_state.scroll_top.min(rows);
+        self.parser_state.scroll_bottom = self.parser_state.scroll_bottom.clamp(self.parser_state.scroll_top, rows);
+        self.state.cursor_x = self.state.cursor_x.min(cols);
+        self.state.cursor_y = self.state.cursor_y.min(rows.saturating_sub(1));
     }
 
     fn advance_cursor(&mut self) {
-        if self.cursor_x < self.cols {
-            self.cursor_x += 1;
+        if self.state.cursor_x < self.state.cols {
+            self.state.cursor_x += 1;
         }
     }
 
     fn scroll_up(&mut self) {
-        let state_arc = self.state.clone();
-        let mut state = state_arc.lock();
-        self.sync_dimensions(state.cols, state.rows);
-        if self.scroll_top >= self.scroll_bottom || self.scroll_bottom > state.grid.len() {
+        self.sync_dimensions();
+        let scroll_top = self.parser_state.scroll_top;
+        let scroll_bottom = self.parser_state.scroll_bottom;
+        if scroll_top >= scroll_bottom || scroll_bottom > self.state.grid.len() {
             return;
         }
-        let scroll_region = state.grid[self.scroll_top..self.scroll_bottom].to_vec();
-        state.scrollback.push(scroll_region[0].clone());
-        if state.scrollback.len() > 10000 {
-            state.scrollback.remove(0);
+        let scroll_region = self.state.grid[scroll_top..scroll_bottom].to_vec();
+        self.state.scrollback.push_back(scroll_region[0].clone());
+        if self.state.scrollback.len() > 10000 {
+            self.state.scrollback.pop_front();
         }
-        for i in self.scroll_top..self.scroll_bottom - 1 {
-            state.grid[i] = state.grid[i + 1].clone();
+        for i in scroll_top..scroll_bottom - 1 {
+            self.state.grid[i] = self.state.grid[i + 1].clone();
         }
-        state.grid[self.scroll_bottom - 1] = self.make_empty_row();
+        self.state.grid[scroll_bottom - 1] = self.make_empty_row();
     }
 
     fn make_empty_row(&self) -> Vec<Cell> {
-        let mut row = Vec::with_capacity(self.cols);
-        for _ in 0..self.cols {
+        let mut row = Vec::with_capacity(self.state.cols);
+        for _ in 0..self.state.cols {
             let mut cell = Cell::default();
-            cell.fg = self.theme.foreground;
-            cell.bg = self.theme.background;
+            cell.fg = self.parser_state.theme.foreground;
+            cell.bg = self.parser_state.theme.background;
             row.push(cell);
         }
         row
     }
-fn is_myanmar_combining(ch: char) -> bool {
-    let u = ch as u32;
-    if u >= 0x1000 && u <= 0x109F {
-        matches!(
-            u,
-            0x102D..=0x1030
-                | 0x1032..=0x1037
-                | 0x1039..=0x103A
-                | 0x103D..=0x103E
-                | 0x1058..=0x1059
-                | 0x105E..=0x1060
-                | 0x1071..=0x1074
-                | 0x1082
-                | 0x1085..=0x1086
-                | 0x108D
-                | 0x109D
-        )
-    } else {
-        false
+
+    fn is_myanmar_combining(ch: char) -> bool {
+        let u = ch as u32;
+        if u >= 0x1000 && u <= 0x109F {
+            matches!(
+                u,
+                0x102D..=0x1030
+                    | 0x1032..=0x1037
+                    | 0x1039..=0x103A
+                    | 0x103D..=0x103E
+                    | 0x1058..=0x1059
+                    | 0x105E..=0x1060
+                    | 0x1071..=0x1074
+                    | 0x1082
+                    | 0x1085..=0x1086
+                    | 0x108D
+                    | 0x109D
+            )
+        } else {
+            false
+        }
     }
-}
 
     fn put_char(&mut self, ch: char) {
-        if self.pending_char.is_some() {
-            self.pending_char = None;
+        if self.parser_state.pending_char.is_some() {
+            self.parser_state.pending_char = None;
         }
 
         let is_combining = !ch.is_control() && (unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) == 0 || Self::is_myanmar_combining(ch));
 
         if is_combining {
-            let (target_x, target_y) = if self.cursor_x > 0 {
-                (self.cursor_x - 1, self.cursor_y)
-            } else if self.cursor_y > 0 {
-                (self.cols - 1, self.cursor_y - 1)
+            let cols = self.state.cols;
+            let cursor_x = self.state.cursor_x;
+            let cursor_y = self.state.cursor_y;
+            let (target_x, target_y) = if cursor_x > 0 {
+                (cursor_x - 1, cursor_y)
+            } else if cursor_y > 0 {
+                (cols - 1, cursor_y - 1)
             } else {
                 (0, 0)
             };
 
-            let state_arc = self.state.clone();
-            let mut state = state_arc.lock();
-            self.sync_dimensions(state.cols, state.rows);
-            if target_y < state.grid.len() && target_x < state.grid[target_y].len() {
-                let cell_ch = &mut state.grid[target_y][target_x].ch;
+            self.sync_dimensions();
+            if target_y < self.state.grid.len() && target_x < self.state.grid[target_y].len() {
+                let cell_ch = &mut self.state.grid[target_y][target_x].ch;
                 if cell_ch == " " {
                     cell_ch.clear();
                 }
@@ -330,29 +339,29 @@ fn is_myanmar_combining(ch: char) -> bool {
             return;
         }
 
-        if self.cursor_x >= self.cols {
-            self.cursor_x = 0;
-            self.cursor_y += 1;
-            if self.cursor_y >= self.rows {
+        if self.state.cursor_x >= self.state.cols {
+            self.state.cursor_x = 0;
+            self.state.cursor_y += 1;
+            if self.state.cursor_y >= self.state.rows {
                 self.scroll_up();
-                self.cursor_y = self.rows.saturating_sub(1);
+                self.state.cursor_y = self.state.rows.saturating_sub(1);
             }
         }
 
         {
-            let state_arc = self.state.clone();
-            let mut state = state_arc.lock();
-            self.sync_dimensions(state.cols, state.rows);
-            if self.cursor_y < state.grid.len() && self.cursor_x < state.grid[self.cursor_y].len() {
-                state.grid[self.cursor_y][self.cursor_x] = Cell {
+            self.sync_dimensions();
+            if self.state.cursor_y < self.state.grid.len() && self.state.cursor_x < self.state.grid[self.state.cursor_y].len() {
+                let x = self.state.cursor_x;
+                let y = self.state.cursor_y;
+                self.state.grid[y][x] = Cell {
                     ch: ch.to_string(),
-                    fg: self.current_fg,
-                    bg: self.current_bg,
-                    bold: self.bold,
-                    italic: self.italic,
-                    underline: self.underline,
-                    dim: self.dim,
-                    inverse: self.inverse,
+                    fg: self.parser_state.current_fg,
+                    bg: self.parser_state.current_bg,
+                    bold: self.parser_state.bold,
+                    italic: self.parser_state.italic,
+                    underline: self.parser_state.underline,
+                    dim: self.parser_state.dim,
+                    inverse: self.parser_state.inverse,
                 };
             }
         }
@@ -362,27 +371,27 @@ fn is_myanmar_combining(ch: char) -> bool {
     fn handle_print(&mut self, ch: char) {
         if ch == '\n' || ch == '\r' {
             if ch == '\r' {
-                self.cursor_x = 0;
+                self.state.cursor_x = 0;
             }
             if ch == '\n' {
-                self.cursor_y += 1;
-                if self.cursor_y >= self.rows {
+                self.state.cursor_y += 1;
+                if self.state.cursor_y >= self.state.rows {
                     self.scroll_up();
-                    self.cursor_y = self.rows - 1;
+                    self.state.cursor_y = self.state.rows - 1;
                 }
             }
             return;
         }
 
         if ch == '\t' {
-            let next_tab = (self.cursor_x / 8 + 1) * 8;
-            self.cursor_x = next_tab.min(self.cols - 1);
+            let next_tab = (self.state.cursor_x / 8 + 1) * 8;
+            self.state.cursor_x = next_tab.min(self.state.cols - 1);
             return;
         }
 
         if ch == '\x08' || ch == '\x7f' {
-            if self.cursor_x > 0 {
-                self.cursor_x -= 1;
+            if self.state.cursor_x > 0 {
+                self.state.cursor_x -= 1;
             }
             return;
         }
@@ -428,31 +437,31 @@ fn is_myanmar_combining(ch: char) -> bool {
             let code: u16 = param.first().copied().unwrap_or(0);
             match code {
                 0 => self.reset_attributes(),
-                1 => self.bold = true,
-                2 => self.dim = true,
-                3 => self.italic = true,
-                4 => self.underline = true,
-                7 => self.inverse = true,
-                22 => { self.bold = false; self.dim = false; }
-                23 => self.italic = false,
-                24 => self.underline = false,
-                27 => self.inverse = false,
-                30..=37 => self.current_fg = self.theme.colors[(code.saturating_sub(30)) as usize % 16],
+                1 => self.parser_state.bold = true,
+                2 => self.parser_state.dim = true,
+                3 => self.parser_state.italic = true,
+                4 => self.parser_state.underline = true,
+                7 => self.parser_state.inverse = true,
+                22 => { self.parser_state.bold = false; self.parser_state.dim = false; }
+                23 => self.parser_state.italic = false,
+                24 => self.parser_state.underline = false,
+                27 => self.parser_state.inverse = false,
+                30..=37 => self.parser_state.current_fg = self.parser_state.theme.colors[(code.saturating_sub(30)) as usize % 16],
                 38 => {
                     if let Some(color) = self.get_color_param(params) {
-                        self.current_fg = color;
+                        self.parser_state.current_fg = color;
                     }
                 }
-                39 => self.current_fg = self.theme.foreground,
-                40..=47 => self.current_bg = self.theme.colors[(code.saturating_sub(40)) as usize % 16],
+                39 => self.parser_state.current_fg = self.parser_state.theme.foreground,
+                40..=47 => self.parser_state.current_bg = self.parser_state.theme.colors[(code.saturating_sub(40)) as usize % 16],
                 48 => {
                     if let Some(color) = self.get_color_param(params) {
-                        self.current_bg = color;
+                        self.parser_state.current_bg = color;
                     }
                 }
-                49 => self.current_bg = self.theme.background,
-                90..=97 => self.current_fg = self.theme.colors[(code.saturating_sub(90) + 8) as usize % 16],
-                100..=107 => self.current_bg = self.theme.colors[(code.saturating_sub(100) + 8) as usize % 16],
+                49 => self.parser_state.current_bg = self.parser_state.theme.background,
+                90..=97 => self.parser_state.current_fg = self.parser_state.theme.colors[(code.saturating_sub(90) + 8) as usize % 16],
+                100..=107 => self.parser_state.current_bg = self.parser_state.theme.colors[(code.saturating_sub(100) + 8) as usize % 16],
                 _ => {}
             }
         }
@@ -466,7 +475,7 @@ fn is_myanmar_combining(ch: char) -> bool {
                 if let Some(p2) = iter.next() {
                     let idx: u16 = p2.first().copied().unwrap_or(0);
                     if idx < 16 {
-                        return Some(self.theme.colors[idx as usize]);
+                        return Some(self.parser_state.theme.colors[idx as usize]);
                     } else if idx < 232 {
                         let idx_u32: u32 = idx as u32;
                         let r: u8 = (((idx_u32.saturating_sub(16)) / 36) * 51) as u8;
@@ -492,13 +501,13 @@ fn is_myanmar_combining(ch: char) -> bool {
     }
 
     fn reset_attributes(&mut self) {
-        self.current_fg = self.theme.foreground;
-        self.current_bg = self.theme.background;
-        self.bold = false;
-        self.italic = false;
-        self.underline = false;
-        self.dim = false;
-        self.inverse = false;
+        self.parser_state.current_fg = self.parser_state.theme.foreground;
+        self.parser_state.current_bg = self.parser_state.theme.background;
+        self.parser_state.bold = false;
+        self.parser_state.italic = false;
+        self.parser_state.underline = false;
+        self.parser_state.dim = false;
+        self.parser_state.inverse = false;
     }
 
     fn cursor_position(&mut self, params: &Params) {
@@ -515,82 +524,84 @@ fn is_myanmar_combining(ch: char) -> bool {
                 col = v as usize;
             }
         }
-        self.cursor_y = row.saturating_sub(1).min(self.rows.saturating_sub(1));
-        self.cursor_x = col.saturating_sub(1).min(self.cols.saturating_sub(1));
+        self.state.cursor_y = row.saturating_sub(1).min(self.state.rows.saturating_sub(1));
+        self.state.cursor_x = col.saturating_sub(1).min(self.state.cols.saturating_sub(1));
     }
 
     fn cursor_up(&mut self, params: &Params) {
         let n = Self::param_or_one(params);
-        self.cursor_y = self.cursor_y.saturating_sub(n);
+        self.state.cursor_y = self.state.cursor_y.saturating_sub(n);
     }
 
     fn cursor_down(&mut self, params: &Params) {
         let n = Self::param_or_one(params);
-        self.cursor_y = (self.cursor_y + n).min(self.rows.saturating_sub(1));
+        self.state.cursor_y = (self.state.cursor_y + n).min(self.state.rows.saturating_sub(1));
     }
 
     fn cursor_forward(&mut self, params: &Params) {
         let n = Self::param_or_one(params);
-        self.cursor_x = (self.cursor_x + n).min(self.cols.saturating_sub(1));
+        self.state.cursor_x = (self.state.cursor_x + n).min(self.state.cols.saturating_sub(1));
     }
 
     fn cursor_back(&mut self, params: &Params) {
         let n = Self::param_or_one(params);
-        self.cursor_x = self.cursor_x.saturating_sub(n);
+        self.state.cursor_x = self.state.cursor_x.saturating_sub(n);
     }
 
     fn cursor_next_line(&mut self, params: &Params) {
         let n = Self::param_or_one(params);
-        self.cursor_y = (self.cursor_y + n).min(self.rows.saturating_sub(1));
-        self.cursor_x = 0;
+        self.state.cursor_y = (self.state.cursor_y + n).min(self.state.rows.saturating_sub(1));
+        self.state.cursor_x = 0;
     }
 
     fn cursor_prev_line(&mut self, params: &Params) {
         let n = Self::param_or_one(params);
-        self.cursor_y = self.cursor_y.saturating_sub(n);
-        self.cursor_x = 0;
+        self.state.cursor_y = self.state.cursor_y.saturating_sub(n);
+        self.state.cursor_x = 0;
     }
 
     fn cursor_character_absolute(&mut self, params: &Params) {
         let n = Self::param_or_one(params);
-        self.cursor_x = n.saturating_sub(1).min(self.cols.saturating_sub(1));
+        self.state.cursor_x = n.saturating_sub(1).min(self.state.cols.saturating_sub(1));
     }
 
     fn erase_in_display(&mut self, params: &Params) {
         let mode = Self::param_or_zero(params);
-        let state_arc = self.state.clone();
-        let mut state = state_arc.lock();
-        self.sync_dimensions(state.cols, state.rows);
+        self.sync_dimensions();
+        let cursor_y = self.state.cursor_y;
+        let cursor_x = self.state.cursor_x;
+        let rows = self.state.rows;
+        let cols = self.state.cols;
         match mode {
             0 => {
-                for y in self.cursor_y..self.rows {
-                    for x in 0..self.cols {
-                        if y == self.cursor_y && x < self.cursor_x {
+                for y in cursor_y..rows {
+                    for x in 0..cols {
+                        if y == cursor_y && x < cursor_x {
                             continue;
                         }
-                        if y < state.grid.len() && x < state.grid[y].len() {
-                            state.grid[y][x] = self.make_cell();
+                        if y < self.state.grid.len() && x < self.state.grid[y].len() {
+                            self.state.grid[y][x] = self.make_cell();
                         }
                     }
                 }
             }
             1 => {
-                for y in 0..=self.cursor_y {
-                    for x in 0..self.cols {
-                        if y == self.cursor_y && x > self.cursor_x {
+                for y in 0..=cursor_y {
+                    for x in 0..cols {
+                        if y == cursor_y && x > cursor_x {
                             continue;
                         }
-                        if y < state.grid.len() && x < state.grid[y].len() {
-                            state.grid[y][x] = self.make_cell();
+                        if y < self.state.grid.len() && x < self.state.grid[y].len() {
+                            self.state.grid[y][x] = self.make_cell();
                         }
                     }
                 }
             }
             2 | 3 => {
-                for y in 0..self.rows {
-                    for x in 0..self.cols {
-                        if y < state.grid.len() && x < state.grid[y].len() {
-                            state.grid[y][x] = self.make_cell();
+                for y in 0..rows {
+                    for x in 0..cols {
+                        if y < self.state.grid.len() && x < self.state.grid[y].len() {
+                            self.state.grid[y][x] = self.make_cell();
                         }
                     }
                 }
@@ -601,31 +612,32 @@ fn is_myanmar_combining(ch: char) -> bool {
 
     fn erase_in_line(&mut self, params: &Params) {
         let mode = Self::param_or_zero(params);
-        let state_arc = self.state.clone();
-        let mut state = state_arc.lock();
-        self.sync_dimensions(state.cols, state.rows);
-        if self.cursor_y >= state.grid.len() {
+        self.sync_dimensions();
+        let cursor_y = self.state.cursor_y;
+        let cursor_x = self.state.cursor_x;
+        let cols = self.state.cols;
+        if cursor_y >= self.state.grid.len() {
             return;
         }
         match mode {
             0 => {
-                for x in self.cursor_x..self.cols {
-                    if x < state.grid[self.cursor_y].len() {
-                        state.grid[self.cursor_y][x] = self.make_cell();
+                for x in cursor_x..cols {
+                    if x < self.state.grid[cursor_y].len() {
+                        self.state.grid[cursor_y][x] = self.make_cell();
                     }
                 }
             }
             1 => {
-                for x in 0..=self.cursor_x {
-                    if x < state.grid[self.cursor_y].len() {
-                        state.grid[self.cursor_y][x] = self.make_cell();
+                for x in 0..=cursor_x {
+                    if x < self.state.grid[cursor_y].len() {
+                        self.state.grid[cursor_y][x] = self.make_cell();
                     }
                 }
             }
             2 => {
-                for x in 0..self.cols {
-                    if x < state.grid[self.cursor_y].len() {
-                        state.grid[self.cursor_y][x] = self.make_cell();
+                for x in 0..cols {
+                    if x < self.state.grid[cursor_y].len() {
+                        self.state.grid[cursor_y][x] = self.make_cell();
                     }
                 }
             }
@@ -635,70 +647,74 @@ fn is_myanmar_combining(ch: char) -> bool {
 
     fn make_cell(&self) -> Cell {
         let mut cell = Cell::default();
-        cell.fg = self.theme.foreground;
-        cell.bg = self.theme.background;
+        cell.fg = self.parser_state.theme.foreground;
+        cell.bg = self.parser_state.theme.background;
         cell
     }
 
     fn insert_lines(&mut self, params: &Params) {
         let n = Self::param_or_one(params);
-        let state_arc = self.state.clone();
-        let mut state = state_arc.lock();
-        self.sync_dimensions(state.cols, state.rows);
-        if self.scroll_top >= self.scroll_bottom || self.scroll_bottom > state.grid.len() {
+        self.sync_dimensions();
+        let scroll_top = self.parser_state.scroll_top;
+        let scroll_bottom = self.parser_state.scroll_bottom;
+        if scroll_top >= scroll_bottom || scroll_bottom > self.state.grid.len() {
             return;
         }
         for _ in 0..n {
-            for i in (self.scroll_top + 1..self.scroll_bottom).rev() {
-                state.grid[i] = state.grid[i - 1].clone();
+            for i in (scroll_top + 1..scroll_bottom).rev() {
+                self.state.grid[i] = self.state.grid[i - 1].clone();
             }
-            state.grid[self.scroll_top] = self.make_empty_row();
+            self.state.grid[scroll_top] = self.make_empty_row();
         }
     }
 
     fn delete_lines(&mut self, params: &Params) {
         let n = Self::param_or_one(params);
-        let state_arc = self.state.clone();
-        let mut state = state_arc.lock();
-        self.sync_dimensions(state.cols, state.rows);
-        if self.scroll_top >= self.scroll_bottom || self.scroll_bottom > state.grid.len() {
+        self.sync_dimensions();
+        let scroll_top = self.parser_state.scroll_top;
+        let scroll_bottom = self.parser_state.scroll_bottom;
+        if scroll_top >= scroll_bottom || scroll_bottom > self.state.grid.len() {
             return;
         }
         for _ in 0..n {
-            for i in self.scroll_top..self.scroll_bottom - 1 {
-                state.grid[i] = state.grid[i + 1].clone();
+            for i in scroll_top..scroll_bottom - 1 {
+                self.state.grid[i] = self.state.grid[i + 1].clone();
             }
-            state.grid[self.scroll_bottom - 1] = self.make_empty_row();
+            self.state.grid[scroll_bottom - 1] = self.make_empty_row();
         }
     }
 
     fn delete_characters(&mut self, params: &Params) {
         let n = Self::param_or_one(params);
-        let state_arc = self.state.clone();
-        let mut state = state_arc.lock();
-        self.sync_dimensions(state.cols, state.rows);
-        if self.cursor_y < state.grid.len() {
-            let row = &mut state.grid[self.cursor_y];
-            for i in self.cursor_x..self.cols.saturating_sub(n) {
+        self.sync_dimensions();
+        let default_cell = self.make_cell();
+        let cursor_y = self.state.cursor_y;
+        let cursor_x = self.state.cursor_x;
+        let cols = self.state.cols;
+        if cursor_y < self.state.grid.len() {
+            let row = &mut self.state.grid[cursor_y];
+            for i in cursor_x..cols.saturating_sub(n) {
                 if i + n < row.len() {
                     row[i] = row[i + n].clone();
                 }
             }
-            for i in self.cols.saturating_sub(n)..self.cols.min(row.len()) {
-                row[i] = self.make_cell();
+            for i in cols.saturating_sub(n)..cols.min(row.len()) {
+                row[i] = default_cell.clone();
             }
         }
     }
 
     fn erase_characters(&mut self, params: &Params) {
         let n = Self::param_or_one(params);
-        let state_arc = self.state.clone();
-        let mut state = state_arc.lock();
-        self.sync_dimensions(state.cols, state.rows);
-        if self.cursor_y < state.grid.len() {
-            let row = &mut state.grid[self.cursor_y];
-            for i in self.cursor_x..(self.cursor_x + n).min(self.cols).min(row.len()) {
-                row[i] = self.make_cell();
+        self.sync_dimensions();
+        let default_cell = self.make_cell();
+        let cursor_y = self.state.cursor_y;
+        let cursor_x = self.state.cursor_x;
+        let cols = self.state.cols;
+        if cursor_y < self.state.grid.len() {
+            let row = &mut self.state.grid[cursor_y];
+            for i in cursor_x..(cursor_x + n).min(cols).min(row.len()) {
+                row[i] = default_cell.clone();
             }
         }
     }
@@ -712,23 +728,23 @@ fn is_myanmar_combining(ch: char) -> bool {
 
     fn scroll_down_csi(&mut self, params: &Params) {
         let n = Self::param_or_one(params);
-        let state_arc = self.state.clone();
-        let mut state = state_arc.lock();
-        self.sync_dimensions(state.cols, state.rows);
-        if self.scroll_top >= self.scroll_bottom || self.scroll_bottom > state.grid.len() {
+        self.sync_dimensions();
+        let scroll_top = self.parser_state.scroll_top;
+        let scroll_bottom = self.parser_state.scroll_bottom;
+        if scroll_top >= scroll_bottom || scroll_bottom > self.state.grid.len() {
             return;
         }
         for _ in 0..n {
-            for i in (self.scroll_top + 1..self.scroll_bottom).rev() {
-                state.grid[i] = state.grid[i - 1].clone();
+            for i in (scroll_top + 1..scroll_bottom).rev() {
+                self.state.grid[i] = self.state.grid[i - 1].clone();
             }
-            state.grid[self.scroll_top] = self.make_empty_row();
+            self.state.grid[scroll_top] = self.make_empty_row();
         }
     }
 
     fn set_scrolling_region(&mut self, params: &Params) {
         let mut top: usize = 1;
-        let mut bottom: usize = self.rows;
+        let mut bottom: usize = self.state.rows;
         let mut iter = params.iter();
         if let Some(p) = iter.next() {
             if let Some(&v) = p.first() {
@@ -740,8 +756,8 @@ fn is_myanmar_combining(ch: char) -> bool {
                 bottom = v as usize;
             }
         }
-        self.scroll_top = top.saturating_sub(1).min(self.rows.saturating_sub(1));
-        self.scroll_bottom = bottom.clamp(self.scroll_top, self.rows);
+        self.parser_state.scroll_top = top.saturating_sub(1).min(self.state.rows.saturating_sub(1));
+        self.parser_state.scroll_bottom = bottom.clamp(self.parser_state.scroll_top, self.state.rows);
     }
 
     fn param_or_zero(params: &Params) -> usize {
@@ -753,16 +769,15 @@ fn is_myanmar_combining(ch: char) -> bool {
     }
 
     fn sync_state(&mut self) {
-        let mut state = self.state.lock();
-        state.cursor_x = self.cursor_x.min(state.cols.saturating_sub(1));
-        state.cursor_y = self.cursor_y.min(state.rows.saturating_sub(1));
-        if let Some(ctx) = &state.ctx {
+        self.state.cursor_x = self.state.cursor_x.min(self.state.cols.saturating_sub(1));
+        self.state.cursor_y = self.state.cursor_y.min(self.state.rows.saturating_sub(1));
+        if let Some(ctx) = &self.state.ctx {
             ctx.request_repaint();
         }
     }
 }
 
-impl Perform for VteHandler {
+impl<'a> Perform for VteHandler<'a> {
     fn print(&mut self, c: char) {
         self.handle_print(c);
     }
@@ -794,7 +809,7 @@ impl Perform for VteHandler {
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
 }
 
-impl Drop for VteHandler {
+impl<'a> Drop for VteHandler<'a> {
     fn drop(&mut self) {
         self.sync_state();
     }
@@ -890,7 +905,7 @@ impl Terminal {
 
         let state = Arc::new(Mutex::new(TerminalState {
             grid,
-            scrollback: Vec::new(),
+            scrollback: VecDeque::new(),
             cursor_x: 0,
             cursor_y: 0,
             cols,
@@ -910,7 +925,7 @@ impl Terminal {
         let read_thread = std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             let mut parser = vte::Parser::new();
-            let mut handler = VteHandler::new(state_clone, theme_clone, cols, rows);
+            let mut parser_state = ParserState::new(theme_clone, cols, rows);
 
             loop {
                 if !*running_clone.lock() {
@@ -919,10 +934,11 @@ impl Terminal {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        let mut state = state_clone.lock();
+                        let mut handler = VteHandler::new(&mut state, &mut parser_state);
                         for &byte in &buf[..n] {
                             parser.advance(&mut handler, byte);
                         }
-                        handler.sync_state();
                     }
                     Err(_) => break,
                 }
@@ -1550,8 +1566,10 @@ impl egui::Widget for TerminalWidget<'_> {
             let tab_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Tab);
             let shift_tab_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Tab);
             if ui.input_mut(|i| i.consume_shortcut(&tab_shortcut)) {
+                self.terminal.scroll_offset = 0;
                 handle_key_event(self.terminal, egui::Key::Tab, &egui::Modifiers::NONE);
             } else if ui.input_mut(|i| i.consume_shortcut(&shift_tab_shortcut)) {
+                self.terminal.scroll_offset = 0;
                 handle_key_event(self.terminal, egui::Key::Tab, &egui::Modifiers::SHIFT);
             }
 
@@ -1560,6 +1578,7 @@ impl egui::Widget for TerminalWidget<'_> {
                     for event in &i.events {
                         match event {
                             egui::Event::Text(text) => {
+                                self.terminal.scroll_offset = 0;
                                 for ch in text.chars() {
                                     let mut buf = [0u8; 4];
                                     let len = ch.encode_utf8(&mut buf).len();
@@ -1567,6 +1586,7 @@ impl egui::Widget for TerminalWidget<'_> {
                                 }
                             }
                             egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                                self.terminal.scroll_offset = 0;
                                 for ch in text.chars() {
                                     let mut buf = [0u8; 4];
                                     let len = ch.encode_utf8(&mut buf).len();
@@ -1581,10 +1601,15 @@ impl egui::Widget for TerminalWidget<'_> {
                             } => {
                                 // Skip Tab key since we handle and consume it above
                                 if *key != egui::Key::Tab {
+                                    let is_scroll_key = (*key == egui::Key::PageUp || *key == egui::Key::PageDown) && (modifiers.ctrl || modifiers.command);
+                                    if !is_scroll_key {
+                                        self.terminal.scroll_offset = 0;
+                                    }
                                     handle_key_event(self.terminal, *key, modifiers);
                                 }
                             }
                             egui::Event::Paste(text) => {
+                                self.terminal.scroll_offset = 0;
                                 self.terminal.paste(text);
                             }
                             egui::Event::Copy => {
@@ -2120,7 +2145,7 @@ mod tests {
     fn test_vte_handler_no_recursion_crash() {
         let state = Arc::new(Mutex::new(TerminalState {
             grid: vec![vec![Cell::default(); 80]; 24],
-            scrollback: Vec::new(),
+            scrollback: VecDeque::new(),
             cursor_x: 0,
             cursor_y: 0,
             cols: 80,
@@ -2131,7 +2156,9 @@ mod tests {
             selection_start: None,
             selection_end: None,
         }));
-        let mut handler = VteHandler::new(state, TerminalTheme::default(), 80, 24);
+        let mut state_guard = state.lock();
+        let mut parser_state = ParserState::new(TerminalTheme::default(), 80, 24);
+        let mut handler = VteHandler::new(&mut state_guard, &mut parser_state);
         let mut parser = vte::Parser::new();
 
         // Feed standard text input
@@ -2149,7 +2176,7 @@ mod tests {
     fn test_myanmar_combining_characters() {
         let state = Arc::new(Mutex::new(TerminalState {
             grid: vec![vec![Cell::default(); 80]; 24],
-            scrollback: Vec::new(),
+            scrollback: VecDeque::new(),
             cursor_x: 0,
             cursor_y: 0,
             cols: 80,
@@ -2160,19 +2187,22 @@ mod tests {
             selection_start: None,
             selection_end: None,
         }));
-        let mut handler = VteHandler::new(state.clone(), TerminalTheme::default(), 80, 24);
         let mut parser = vte::Parser::new();
+        let mut parser_state = ParserState::new(TerminalTheme::default(), 80, 24);
+        {
+            let mut state_guard = state.lock();
+            let mut handler = VteHandler::new(&mut state_guard, &mut parser_state);
 
-        // Feed "မြေ" -> မ (U+1019) + ြ (U+103C) + ေ (U+1031)
-        // In UTF-8:
-        // မ = \xe1\x80\x99
-        // ြ = \xe1\x80\xbc
-        // ေ = \xe1\x80\xb1
-        let input_bytes = b"\xe1\x80\x99\xe1\x80\xbc\xe1\x80\xb1";
-        for byte in input_bytes {
-            parser.advance(&mut handler, *byte);
+            // Feed "မြေ" -> မ (U+1019) + ြ (U+103C) + ေ (U+1031)
+            // In UTF-8:
+            // မ = \xe1\x80\x99
+            // ြ = \xe1\x80\xbc
+            // ေ = \xe1\x80\xb1
+            let input_bytes = b"\xe1\x80\x99\xe1\x80\xbc\xe1\x80\xb1";
+            for byte in input_bytes {
+                parser.advance(&mut handler, *byte);
+            }
         }
-        handler.sync_state();
 
         let s = state.lock();
         // The characters are stored in separate cells because they have wcwidth == 1
@@ -2227,7 +2257,7 @@ mod tests {
     fn test_terminal_grid_zsh_myanmar() {
         let state = Arc::new(Mutex::new(TerminalState {
             grid: vec![vec![Cell::default(); 80]; 24],
-            scrollback: Vec::new(),
+            scrollback: VecDeque::new(),
             cursor_x: 0,
             cursor_y: 0,
             cols: 80,
@@ -2238,21 +2268,24 @@ mod tests {
             selection_start: None,
             selection_end: None,
         }));
-        let mut handler = VteHandler::new(state.clone(), TerminalTheme::default(), 80, 24);
         let mut parser = vte::Parser::new();
+        let mut parser_state = ParserState::new(TerminalTheme::default(), 80, 24);
+        {
+            let mut state_guard = state.lock();
+            let mut handler = VteHandler::new(&mut state_guard, &mut parser_state);
 
-        // Raw bytes from Zsh echo
-        let zsh_bytes: &[u8] = &[
-            225, 128, 148, 8, 225, 128, 148, 225, 128, 177, 225, 128, 128, 225, 128, 177,
-            225, 128, 172, 225, 128, 132, 8, 225, 128, 132, 225, 128, 186, 225, 128, 184,
-            225, 128, 149, 225, 128, 171, 225, 128, 158, 225, 128, 156, 225, 128, 172,
-            225, 128, 184
-        ];
+            // Raw bytes from Zsh echo
+            let zsh_bytes: &[u8] = &[
+                225, 128, 148, 8, 225, 128, 148, 225, 128, 177, 225, 128, 128, 225, 128, 177,
+                225, 128, 172, 225, 128, 132, 8, 225, 128, 132, 225, 128, 186, 225, 128, 184,
+                225, 128, 149, 225, 128, 171, 225, 128, 158, 225, 128, 156, 225, 128, 172,
+                225, 128, 184
+            ];
 
-        for &byte in zsh_bytes {
-            parser.advance(&mut handler, byte);
+            for &byte in zsh_bytes {
+                parser.advance(&mut handler, byte);
+            }
         }
-        handler.sync_state();
 
         let s = state.lock();
         for col in 0..15 {
@@ -2279,6 +2312,41 @@ mod tests {
         assert_eq!(urls[0].0, "http://localhost:3002/");
         assert_eq!(urls[1].0, "https://google.com/search?q=rust");
         assert_eq!(urls[2].0, "http://example.com/test");
+    }
+
+    #[test]
+    fn test_scroll_behavior() {
+        let settings = TerminalSettings::default();
+        let mut terminal = Terminal::new(settings, None).unwrap();
+        
+        // Mock state: add some lines to scrollback so scrollback.len() > 0
+        {
+            let mut state = terminal.state.lock();
+            state.scrollback.push_back(vec![Cell::default(); 80]);
+            state.scrollback.push_back(vec![Cell::default(); 80]);
+        }
+
+        // Test terminal.scroll directly
+        terminal.scroll(-1);
+        assert_eq!(terminal.scroll_offset, -1);
+
+        terminal.scroll(-5); // should clamp to -2 because scrollback.len() is 2
+        assert_eq!(terminal.scroll_offset, -2);
+
+        terminal.scroll(1);
+        assert_eq!(terminal.scroll_offset, -1);
+
+        // Test handle_key_event with Ctrl + PageUp/PageDown
+        let ctrl_modifiers = egui::Modifiers {
+            ctrl: true,
+            ..egui::Modifiers::NONE
+        };
+        
+        handle_key_event(&mut terminal, egui::Key::PageUp, &ctrl_modifiers);
+        assert_eq!(terminal.scroll_offset, -2); // scrolled up (more negative) by -10, clamped to -2
+
+        handle_key_event(&mut terminal, egui::Key::PageDown, &ctrl_modifiers);
+        assert_eq!(terminal.scroll_offset, 0); // scrolled down (towards bottom), clamped to 0
     }
 }
 

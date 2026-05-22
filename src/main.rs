@@ -1978,10 +1978,31 @@ fn apply_font(ctx: &egui::Context, family_name: &str, discovered_fonts: &[(Strin
 fn main() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let msg = info.to_string();
+        let payload = info.payload();
+        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            "Unknown panic payload"
+        };
+
         if msg.contains("accesskit") || msg.contains("panic in a destructor") {
             unsafe { libc::_exit(0); }
         }
+
+        let location = info.location()
+            .map(|l| format!("at {}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+
+        let full_msg = format!("Application crashed due to a panic.\n\nMessage: {}\nLocation: {}", msg, location);
+
+        rfd::MessageDialog::new()
+            .set_title("Fatal Error")
+            .set_description(&full_msg)
+            .set_level(rfd::MessageLevel::Error)
+            .show();
+
         default_hook(info);
     }));
 
@@ -2006,7 +2027,18 @@ fn main() {
         Ok(Box::new(app) as Box<dyn eframe::App>)
     });
 
-    let _ = eframe::run_native("Workspace Manager", options, app_creator);
+    let res = eframe::run_native("Workspace Manager", options, app_creator);
+    if let Err(e) = res {
+        let err_msg = format!(
+            "Failed to start the application.\n\nError: {:?}\n\nThis is usually caused by missing or outdated graphics drivers (OpenGL 3.3+ support is required).",
+            e
+        );
+        rfd::MessageDialog::new()
+            .set_title("Startup Error")
+            .set_description(&err_msg)
+            .set_level(rfd::MessageLevel::Error)
+            .show();
+    }
 
     unsafe { libc::_exit(0); }
 }
