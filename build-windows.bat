@@ -37,7 +37,7 @@ if exist "%WIX_DIR%\candle.exe" (
     "%WIX_DIR%\candle.exe" -out "%BUILD_DIR%\workspace-manager.wixobj" wix\workspace-manager.wxs
     if %errorlevel% equ 0 (
         echo Linking installer...
-        "%WIX_DIR%\light.exe" -out "%BUILD_DIR%\workspace-manager-%VERSION%-windows.msi" "%BUILD_DIR%\workspace-manager.wixobj"
+        "%WIX_DIR%\light.exe" -sval -out "%BUILD_DIR%\workspace-manager-%VERSION%-windows.msi" "%BUILD_DIR%\workspace-manager.wixobj"
         if %errorlevel% equ 0 (
             echo ✓ MSI Installer created: %BUILD_DIR%\workspace-manager-%VERSION%-windows.msi
         ) else (

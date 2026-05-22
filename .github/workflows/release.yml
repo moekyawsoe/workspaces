@@ -122,7 +122,7 @@ jobs:
           # Add WiX bin directory to path and compile/link
           $env:PATH += ";C:\Program Files (x86)\WiX Toolset v3.11\bin"
           candle.exe -out "$BUILD_DIR\workspace-manager.wixobj" wix\workspace-manager.wxs
-          light.exe -out "$BUILD_DIR\workspace-manager-$VERSION-windows.msi" "$BUILD_DIR\workspace-manager.wixobj"
+          light.exe -sval -out "$BUILD_DIR\workspace-manager-$VERSION-windows.msi" "$BUILD_DIR\workspace-manager.wixobj"
           
           # Compress to zip
           Compress-Archive -Path "$BUILD_DIR\workspace-manager.exe" -DestinationPath "$BUILD_DIR\workspace-manager-$VERSION-windows.zip"

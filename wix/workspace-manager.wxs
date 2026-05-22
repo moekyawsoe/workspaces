@@ -9,7 +9,8 @@
            
     <Package InstallerVersion="200" 
              Compressed="yes" 
-             InstallScope="perMachine" />
+             InstallScope="perMachine" 
+             Platform="x64" />
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     
@@ -17,7 +18,7 @@
 
     <!-- Directory Structure -->
     <Directory Id="TARGETDIR" Name="SourceDir">
-      <Directory Id="ProgramFilesFolder">
+      <Directory Id="ProgramFiles64Folder">
         <Directory Id="INSTALLDIR" Name="Workspace Manager" />
       </Directory>
       <Directory Id="ProgramMenuFolder">
@@ -28,29 +29,20 @@
 
     <!-- Components to install -->
     <DirectoryRef Id="INSTALLDIR">
-      <Component Id="MainExecutable" Guid="A76F32A3-D19C-4CD8-87FA-BD3EDCF4B751">
+      <Component Id="MainExecutable" Guid="A76F32A3-D19C-4CD8-87FA-BD3EDCF4B751" Win64="yes">
         <File Id="WorkspaceManagerExe" 
               Source="build\windows\workspace-manager.exe" 
-              KeyPath="yes">
-          <!-- Start Menu Shortcut -->
-          <Shortcut Id="StartMenuShortcut"
-                    Directory="ApplicationProgramsFolder"
-                    Name="Workspace Manager"
-                    WorkingDirectory="INSTALLDIR"
-                    Advertise="yes" />
-          <!-- Desktop Shortcut -->
-          <Shortcut Id="DesktopShortcut"
-                    Directory="DesktopFolder"
-                    Name="Workspace Manager"
-                    WorkingDirectory="INSTALLDIR"
-                    Advertise="yes" />
-        </File>
+              KeyPath="yes" />
       </Component>
     </DirectoryRef>
 
-    <!-- Clean up shortcuts during uninstall -->
+    <!-- Shortcuts -->
     <DirectoryRef Id="ApplicationProgramsFolder">
       <Component Id="ApplicationShortcut" Guid="C19F68B6-733B-4DDF-A405-A7B8BD309F21">
+        <Shortcut Id="StartMenuShortcut"
+                  Name="Workspace Manager"
+                  Target="[INSTALLDIR]workspace-manager.exe"
+                  WorkingDirectory="INSTALLDIR" />
         <RemoveFolder Id="CleanUpShortcuts" On="uninstall" />
         <RegistryValue Root="HKCU" 
                        Key="Software\MoeKyawSoe\WorkspaceManager" 
@@ -61,10 +53,26 @@
       </Component>
     </DirectoryRef>
 
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcutComponent" Guid="D2A91D3C-72BE-4C94-A9D1-BEF48762D71A">
+        <Shortcut Id="DesktopShortcut"
+                  Name="Workspace Manager"
+                  Target="[INSTALLDIR]workspace-manager.exe"
+                  WorkingDirectory="INSTALLDIR" />
+        <RegistryValue Root="HKCU" 
+                       Key="Software\MoeKyawSoe\WorkspaceManager" 
+                       Name="desktop_shortcut" 
+                       Type="integer" 
+                       Value="1" 
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
     <!-- Features -->
     <Feature Id="Complete" Title="Workspace Manager" Level="1">
       <ComponentRef Id="MainExecutable" />
       <ComponentRef Id="ApplicationShortcut" />
+      <ComponentRef Id="DesktopShortcutComponent" />
     </Feature>
 
   </Product>
