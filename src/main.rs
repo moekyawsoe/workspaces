@@ -2006,30 +2006,54 @@ fn main() {
         default_hook(info);
     }));
 
-    let options = eframe::NativeOptions {
+    let make_app_creator = || {
+        let app_creator = Box::new(|cc: &eframe::CreationContext<'_>| {
+            let discovered = discover_fonts();
+            let settings = load_terminal_settings();
+
+            apply_font(&cc.egui_ctx, &settings.font.family, &discovered);
+
+            let mut app = WorkspaceManagerApp::default();
+            app.discovered_fonts = discovered;
+            app.terminal_settings = settings;
+
+            Ok(Box::new(app) as Box<dyn eframe::App>)
+        });
+        app_creator
+    };
+
+    let make_options = |renderer| eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
             .with_min_inner_size([600.0, 400.0])
             .with_title("Workspace Manager"),
-        #[cfg(target_os = "windows")]
-        renderer: eframe::Renderer::Wgpu,
+        renderer,
         ..Default::default()
     };
 
-    let app_creator = Box::new(|cc: &eframe::CreationContext<'_>| {
-        let discovered = discover_fonts();
-        let settings = load_terminal_settings();
+    #[cfg(target_os = "windows")]
+    let mut renderer = eframe::Renderer::Wgpu;
+    #[cfg(not(target_os = "windows"))]
+    let renderer = eframe::Renderer::Glow;
 
-        apply_font(&cc.egui_ctx, &settings.font.family, &discovered);
+    #[allow(unused_mut)]
+    let mut res = eframe::run_native(
+        "Workspace Manager",
+        make_options(renderer),
+        make_app_creator(),
+    );
 
-        let mut app = WorkspaceManagerApp::default();
-        app.discovered_fonts = discovered;
-        app.terminal_settings = settings;
+    #[cfg(target_os = "windows")]
+    if res.is_err() {
+        // If Wgpu failed (e.g. NoSuitableAdapterFound), attempt to fallback to Glow (OpenGL)
+        renderer = eframe::Renderer::Glow;
+        res = eframe::run_native(
+            "Workspace Manager",
+            make_options(renderer),
+            make_app_creator(),
+        );
+    }
 
-        Ok(Box::new(app) as Box<dyn eframe::App>)
-    });
-
-    let res = eframe::run_native("Workspace Manager", options, app_creator);
     if let Err(e) = res {
         let err_msg = format!(
             "Failed to start the application.\n\nError: {:?}\n\nThis is usually caused by missing or outdated graphics drivers (OpenGL 3.3+ support is required).",

@@ -469,21 +469,46 @@ fn install_macos(download_path: &PathBuf) -> Result<(), Box<dyn std::error::Erro
 fn replace_binary(new_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let current_exe = std::env::current_exe()?;
 
-    if let Err(_) = std::fs::copy(new_path, &current_exe) {
+    // First try to delete the current running binary so we can overwrite it.
+    // This prevents the "Text file busy" error.
+    let remove_result = std::fs::remove_file(&current_exe);
+
+    // Try copying the file as the current user
+    let copy_result = if remove_result.is_ok() {
+        std::fs::copy(new_path, &current_exe).map(|_| ())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Permission denied or failed to remove old binary",
+        ))
+    };
+
+    if let Err(_) = copy_result {
         #[cfg(target_os = "linux")]
         {
-            let status = std::process::Command::new("pkexec")
-                .arg("cp")
-                .arg(new_path)
+            // If copy failed (likely due to permission denied on system folders like /usr/bin),
+            // run a single pkexec command to remove the old binary, copy the new one, and make it executable.
+            let output = std::process::Command::new("pkexec")
+                .arg("sh")
+                .arg("-c")
+                .arg("rm -f \"$1\" && cp \"$2\" \"$1\" && chmod 755 \"$1\"")
+                .arg("--")
                 .arg(&current_exe)
-                .status()?;
+                .arg(new_path)
+                .output()?;
             
-            if !status.success() {
-                return Err("Failed to copy new binary with elevated privileges (pkexec)".into());
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!(
+                    "Failed to copy new binary with elevated privileges (pkexec). Error: {}",
+                    stderr.trim()
+                ).into());
             }
         }
         #[cfg(not(target_os = "linux"))]
         {
+            // For other platforms, try standard copy (which might fail, but let's propagate the error)
+            let _ = std::fs::remove_file(&current_exe); // try again
             std::fs::copy(new_path, &current_exe)?;
         }
     }
@@ -494,13 +519,7 @@ fn replace_binary(new_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> 
         if let Ok(metadata) = std::fs::metadata(&current_exe) {
             let mut perms = metadata.permissions();
             perms.set_mode(0o755);
-            if let Err(_) = std::fs::set_permissions(&current_exe, perms) {
-                let _ = std::process::Command::new("pkexec")
-                    .arg("chmod")
-                    .arg("755")
-                    .arg(&current_exe)
-                    .status();
-            }
+            let _ = std::fs::set_permissions(&current_exe, perms);
         }
     }
 
