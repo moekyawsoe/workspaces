@@ -468,14 +468,40 @@ fn install_macos(download_path: &PathBuf) -> Result<(), Box<dyn std::error::Erro
 
 fn replace_binary(new_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let current_exe = std::env::current_exe()?;
-    std::fs::copy(new_path, &current_exe)?;
+
+    if let Err(_) = std::fs::copy(new_path, &current_exe) {
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::process::Command::new("pkexec")
+                .arg("cp")
+                .arg(new_path)
+                .arg(&current_exe)
+                .status()?;
+            
+            if !status.success() {
+                return Err("Failed to copy new binary with elevated privileges (pkexec)".into());
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::fs::copy(new_path, &current_exe)?;
+        }
+    }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&current_exe)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&current_exe, perms)?;
+        if let Ok(metadata) = std::fs::metadata(&current_exe) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o755);
+            if let Err(_) = std::fs::set_permissions(&current_exe, perms) {
+                let _ = std::process::Command::new("pkexec")
+                    .arg("chmod")
+                    .arg("755")
+                    .arg(&current_exe)
+                    .status();
+            }
+        }
     }
 
     Ok(())
