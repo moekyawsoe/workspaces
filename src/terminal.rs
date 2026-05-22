@@ -1137,6 +1137,7 @@ impl<'a> TerminalWidget<'a> {
 impl egui::Widget for TerminalWidget<'_> {
     fn ui(self, ui: &mut egui::Ui) -> egui::Response {
         let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
+        ui.memory_mut(|mem| mem.interested_in_focus(response.id));
 
         let font_size = self.terminal.settings.font.size;
         let char_width = font_size * 0.6;
@@ -1526,6 +1527,15 @@ impl egui::Widget for TerminalWidget<'_> {
         }
 
         if response.has_focus() {
+            ui.ctx().memory_mut(|mem| {
+                mem.set_focus_lock_filter(
+                    response.id,
+                    egui::EventFilter {
+                        tab: true,
+                        ..Default::default()
+                    },
+                );
+            });
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::IMEAllowed(true));
             let cursor_screen_y = (sb_len + state.cursor_y).saturating_sub(view_start);
             let cursor_x_pos = response.rect.min.x + state.cursor_x as f32 * char_width;

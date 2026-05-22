@@ -10,6 +10,13 @@ use update::*;
 use workspace::*;
 
 #[derive(Clone)]
+enum ViewportCmd {
+    Dock(usize),
+    Close(usize),
+    Error(String),
+}
+
+#[derive(Clone)]
 struct FormFolder {
     path: String,
     name: String,
@@ -214,7 +221,8 @@ struct WorkspaceManagerApp {
     terminal_message: Option<String>,
 
     terminal_tabs: Vec<TerminalTab>,
-    floating_tabs: Vec<TerminalTab>,
+    floating_tabs: Vec<std::sync::Arc<parking_lot::Mutex<TerminalTab>>>,
+    viewport_commands: std::sync::Arc<parking_lot::Mutex<Vec<ViewportCmd>>>,
     active_tab_index: usize,
     terminal_visible: bool,
     terminal_settings: TerminalSettings,
@@ -266,6 +274,7 @@ impl Default for WorkspaceManagerApp {
             terminal_message: None,
             terminal_tabs: Vec::new(),
             floating_tabs: Vec::new(),
+            viewport_commands: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             active_tab_index: 0,
             terminal_visible: false,
             terminal_settings,
@@ -754,119 +763,166 @@ impl eframe::App for WorkspaceManagerApp {
             self.floating_tabs.clear();
         }
 
-        let mut tab_to_dock = None;
-        let mut tab_to_close_float = None;
+        let viewport_commands = self.viewport_commands.clone();
+        for (idx, tab_arc) in self.floating_tabs.iter().enumerate() {
+            let tab_arc_clone = tab_arc.clone();
+            let viewport_commands_clone = viewport_commands.clone();
+            let terminal_settings_clone = self.terminal_settings.clone();
+            let viewport_id = egui::ViewportId::from_hash_of(&(std::sync::Arc::as_ptr(&tab_arc) as usize));
+            let tab_name = {
+                let lock = tab_arc.lock();
+                lock.name.clone()
+            };
 
-        for (idx, tab) in self.floating_tabs.iter_mut().enumerate() {
-            let mut is_open = true;
-            egui::Window::new(&tab.name)
-                .open(&mut is_open)
-                .default_size(egui::vec2(700.0, 450.0))
-                .show(ctx, |ui| {
-                    ui.vertical(|ui| {
-                        // Toolbar inside the floating window
-                        ui.horizontal(|ui| {
-                            if ui.small_button("⤵ Dock").on_hover_text("Dock back to bottom panel").clicked() {
-                                tab_to_dock = Some(idx);
-                            }
-                            ui.separator();
-                            if ui.small_button("x Close Pane").on_hover_text("Close active pane").clicked() {
-                                if let Some(active_id) = tab.active_terminal_id {
-                                    let mut removed = false;
-                                    let opt_pane = tab.root.close_pane(active_id, &mut removed);
-                                    if removed {
-                                        if let Some(new_root) = opt_pane {
-                                            match new_root {
-                                                TerminalPane::Placeholder => {
-                                                    tab_to_close_float = Some(idx);
+            ctx.show_viewport_immediate(
+                viewport_id,
+                egui::ViewportBuilder::default()
+                    .with_title(&tab_name)
+                    .with_inner_size(egui::vec2(700.0, 450.0)),
+                move |ctx, _class| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut tab_guard = tab_arc_clone.lock();
+                        let tab: &mut TerminalTab = &mut *tab_guard;
+                        ui.vertical(|ui| {
+                            // Toolbar inside the floating window
+                            ui.horizontal(|ui| {
+                                if ui.small_button("⤵ Dock").on_hover_text("Dock back to bottom panel").clicked() {
+                                    viewport_commands_clone.lock().push(ViewportCmd::Dock(idx));
+                                }
+                                ui.separator();
+                                if ui.small_button("x Close Pane").on_hover_text("Close active pane").clicked() {
+                                    if let Some(active_id) = tab.active_terminal_id {
+                                        let mut removed = false;
+                                        let opt_pane = tab.root.close_pane(active_id, &mut removed);
+                                        if removed {
+                                            if let Some(new_root) = opt_pane {
+                                                match new_root {
+                                                    TerminalPane::Placeholder => {
+                                                        viewport_commands_clone.lock().push(ViewportCmd::Close(idx));
+                                                    }
+                                                    _ => {
+                                                        tab.root = new_root;
+                                                        tab.active_terminal_id = tab.root.any_terminal_id();
+                                                    }
                                                 }
-                                                _ => {
-                                                    tab.root = new_root;
-                                                    tab.active_terminal_id = tab.root.any_terminal_id();
-                                                }
+                                            } else {
+                                                tab.active_terminal_id = tab.root.any_terminal_id();
                                             }
-                                        } else {
-                                            tab.active_terminal_id = tab.root.any_terminal_id();
                                         }
                                     }
                                 }
-                            }
-                            if ui.small_button("| Split V").on_hover_text("Split active pane vertically").clicked() {
-                                if let Some(active_id) = tab.active_terminal_id {
-                                    let working_dir = tab.root.find_terminal_mut(active_id)
-                                        .and_then(|t| t.current_working_dir())
-                                        .or_else(|| dirs::home_dir());
-                                    match Terminal::new(self.terminal_settings.clone(), working_dir) {
-                                        Ok(new_term) => {
-                                            let new_id = new_term.id;
-                                            let mut term_opt = Some(new_term);
-                                            tab.root.split(active_id, SplitDirection::Vertical, &mut term_opt);
-                                            tab.active_terminal_id = Some(new_id);
-                                        }
-                                        Err(e) => {
-                                            self.message = Message::Error(format!("Failed to split terminal: {}", e));
-                                        }
-                                    }
-                                }
-                            }
-                            if ui.small_button("| Split H").on_hover_text("Split active pane horizontally").clicked() {
-                                if let Some(active_id) = tab.active_terminal_id {
-                                    let working_dir = tab.root.find_terminal_mut(active_id)
-                                        .and_then(|t| t.current_working_dir())
-                                        .or_else(|| dirs::home_dir());
-                                    match Terminal::new(self.terminal_settings.clone(), working_dir) {
-                                        Ok(new_term) => {
-                                            let new_id = new_term.id;
-                                            let mut term_opt = Some(new_term);
-                                            tab.root.split(active_id, SplitDirection::Horizontal, &mut term_opt);
-                                            tab.active_terminal_id = Some(new_id);
-                                        }
-                                        Err(e) => {
-                                            self.message = Message::Error(format!("Failed to split terminal: {}", e));
+                                if ui.small_button("| Split V").on_hover_text("Split active pane vertically").clicked() {
+                                    if let Some(active_id) = tab.active_terminal_id {
+                                        let working_dir = tab.root.find_terminal_mut(active_id)
+                                            .and_then(|t| t.current_working_dir())
+                                            .or_else(|| dirs::home_dir());
+                                        match Terminal::new(terminal_settings_clone.clone(), working_dir) {
+                                            Ok(new_term) => {
+                                                let new_id = new_term.id;
+                                                let mut term_opt = Some(new_term);
+                                                tab.root.split(active_id, SplitDirection::Vertical, &mut term_opt);
+                                                tab.active_terminal_id = Some(new_id);
+                                            }
+                                            Err(e) => {
+                                                viewport_commands_clone.lock().push(ViewportCmd::Error(format!("Failed to split terminal: {}", e)));
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            if ui.small_button("🗐 Duplicate").on_hover_text("Duplicate active pane").clicked() {
-                                if let Some(active_id) = tab.active_terminal_id {
-                                    let working_dir = tab.root.find_terminal_mut(active_id)
-                                        .and_then(|t| t.current_working_dir())
-                                        .or_else(|| dirs::home_dir());
-                                    match Terminal::new(self.terminal_settings.clone(), working_dir) {
-                                        Ok(new_term) => {
-                                            let new_id = new_term.id;
-                                            let mut term_opt = Some(new_term);
-                                            tab.root.split(active_id, SplitDirection::Horizontal, &mut term_opt);
-                                            tab.active_terminal_id = Some(new_id);
-                                        }
-                                        Err(e) => {
-                                            self.message = Message::Error(format!("Failed to split terminal: {}", e));
+                                if ui.small_button("| Split H").on_hover_text("Split active pane horizontally").clicked() {
+                                    if let Some(active_id) = tab.active_terminal_id {
+                                        let working_dir = tab.root.find_terminal_mut(active_id)
+                                            .and_then(|t| t.current_working_dir())
+                                            .or_else(|| dirs::home_dir());
+                                        match Terminal::new(terminal_settings_clone.clone(), working_dir) {
+                                            Ok(new_term) => {
+                                                let new_id = new_term.id;
+                                                let mut term_opt = Some(new_term);
+                                                tab.root.split(active_id, SplitDirection::Horizontal, &mut term_opt);
+                                                tab.active_terminal_id = Some(new_id);
+                                            }
+                                            Err(e) => {
+                                                viewport_commands_clone.lock().push(ViewportCmd::Error(format!("Failed to split terminal: {}", e)));
+                                            }
                                         }
                                     }
                                 }
-                            }
+                                if ui.small_button("🗐 Duplicate").on_hover_text("Duplicate active pane").clicked() {
+                                    if let Some(active_id) = tab.active_terminal_id {
+                                        let working_dir = tab.root.find_terminal_mut(active_id)
+                                            .and_then(|t| t.current_working_dir())
+                                            .or_else(|| dirs::home_dir());
+                                        match Terminal::new(terminal_settings_clone.clone(), working_dir) {
+                                            Ok(new_term) => {
+                                                let new_id = new_term.id;
+                                                let mut term_opt = Some(new_term);
+                                                tab.root.split(active_id, SplitDirection::Horizontal, &mut term_opt);
+                                                tab.active_terminal_id = Some(new_id);
+                                            }
+                                            Err(e) => {
+                                                viewport_commands_clone.lock().push(ViewportCmd::Error(format!("Failed to split terminal: {}", e)));
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                            ui.separator();
+
+                            let active_id = &mut tab.active_terminal_id;
+                            tab.root.render(ui, active_id, ctx);
                         });
-                        ui.separator();
-
-                        let active_id = &mut tab.active_terminal_id;
-                        tab.root.render(ui, active_id, ctx);
                     });
-                });
 
-            if !is_open {
-                tab_to_close_float = Some(idx);
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        viewport_commands_clone.lock().push(ViewportCmd::Close(idx));
+                    }
+                }
+            );
+        }
+
+        // Process viewport commands at the end of the frame
+        let mut commands = Vec::new();
+        {
+            let mut lock = self.viewport_commands.lock();
+            if !lock.is_empty() {
+                commands = std::mem::take(&mut *lock);
             }
         }
 
-        if let Some(idx) = tab_to_dock {
-            let tab = self.floating_tabs.remove(idx);
-            self.terminal_tabs.push(tab);
-            self.active_tab_index = self.terminal_tabs.len() - 1;
-            self.terminal_visible = true;
-        }
+        if !commands.is_empty() {
+            let mut removals = Vec::new(); // stores (index, should_dock)
+            for cmd in commands {
+                match cmd {
+                    ViewportCmd::Dock(idx) => removals.push((idx, true)),
+                    ViewportCmd::Close(idx) => removals.push((idx, false)),
+                    ViewportCmd::Error(e) => {
+                        self.message = Message::Error(e);
+                    }
+                }
+            }
 
-        if let Some(idx) = tab_to_close_float {
-            self.floating_tabs.remove(idx);
+            // Sort by index descending to avoid index shifting when removing elements
+            removals.sort_by(|a, b| b.0.cmp(&a.0));
+            removals.dedup_by(|a, b| a.0 == b.0);
+
+            for (idx, should_dock) in removals {
+                if idx < self.floating_tabs.len() {
+                    let tab_arc = self.floating_tabs.remove(idx);
+                    if should_dock {
+                        let tab = std::mem::replace(
+                            &mut *tab_arc.lock(),
+                            TerminalTab {
+                                name: String::new(),
+                                root: TerminalPane::Placeholder,
+                                active_terminal_id: None,
+                            },
+                        );
+                        self.terminal_tabs.push(tab);
+                        self.active_tab_index = self.terminal_tabs.len() - 1;
+                        self.terminal_visible = true;
+                    }
+                }
+            }
         }
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
@@ -958,7 +1014,7 @@ impl eframe::App for WorkspaceManagerApp {
                             }
                             if let Some(idx) = tab_to_float {
                                 let tab = self.terminal_tabs.remove(idx);
-                                self.floating_tabs.push(tab);
+                                self.floating_tabs.push(std::sync::Arc::new(parking_lot::Mutex::new(tab)));
                                 if self.terminal_tabs.is_empty() {
                                     self.terminal_visible = false;
                                 } else if self.active_tab_index >= self.terminal_tabs.len() {
@@ -998,7 +1054,7 @@ impl eframe::App for WorkspaceManagerApp {
                                     if !self.terminal_tabs.is_empty() {
                                         let idx = self.active_tab_index;
                                         let tab = self.terminal_tabs.remove(idx);
-                                        self.floating_tabs.push(tab);
+                                        self.floating_tabs.push(std::sync::Arc::new(parking_lot::Mutex::new(tab)));
                                         if self.terminal_tabs.is_empty() {
                                             self.terminal_visible = false;
                                         } else if self.active_tab_index >= self.terminal_tabs.len() {
@@ -1589,7 +1645,7 @@ impl eframe::App for WorkspaceManagerApp {
                                         tab.root.update_settings(&self.terminal_settings);
                                     }
                                     for tab in &mut self.floating_tabs {
-                                        tab.root.update_settings(&self.terminal_settings);
+                                        tab.lock().root.update_settings(&self.terminal_settings);
                                     }
                                     self.dialog = DialogState::None;
                                 }
@@ -1601,7 +1657,7 @@ impl eframe::App for WorkspaceManagerApp {
                                         tab.root.update_settings(&self.terminal_settings);
                                     }
                                     for tab in &mut self.floating_tabs {
-                                        tab.root.update_settings(&self.terminal_settings);
+                                        tab.lock().root.update_settings(&self.terminal_settings);
                                     }
                                 }
                                 if ui.button("Close").clicked() {
