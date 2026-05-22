@@ -2011,6 +2011,8 @@ fn main() {
             .with_inner_size([800.0, 600.0])
             .with_min_inner_size([600.0, 400.0])
             .with_title("Workspace Manager"),
+        #[cfg(target_os = "windows")]
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
 
